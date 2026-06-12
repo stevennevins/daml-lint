@@ -3,18 +3,12 @@ use std::path::Path;
 
 /// Parse a DAML source file into a DamlModule IR.
 ///
-/// Uses tree-sitter-haskell for validation, then a line-based DAML keyword shim
-/// to extract templates, choices, fields, and ensure clauses. tree-sitter-haskell
-/// treats DAML keywords as identifiers, so structural extraction is done by
-/// matching indentation-based patterns in the source text.
+/// Line-based DAML keyword shim extracting templates, choices, fields, and
+/// ensure clauses by matching indentation-based patterns in the source text.
+/// (A previous tree-sitter-haskell "validation" pass was removed: its result
+/// was discarded, and parsing certain files corrupted the heap — SIGABRT on
+/// multi-file scans.)
 pub fn parse_daml(source: &str, file: &Path) -> DamlModule {
-    // Validate with tree-sitter (best-effort — DAML may have parse errors)
-    let mut ts_parser = tree_sitter::Parser::new();
-    ts_parser
-        .set_language(&tree_sitter_haskell::LANGUAGE.into())
-        .expect("Error loading Haskell parser");
-    let _tree = ts_parser.parse(source, None);
-
     let lines: Vec<&str> = source.lines().collect();
     let module_name = extract_module_name(&lines);
     let imports = extract_imports(&lines);
