@@ -1,31 +1,32 @@
 use crate::detector::{parse_severity, Detector, Finding, Severity};
 use crate::ir::DamlModule;
-use rhai::{Dynamic, Engine, Scope};
+use rquickjs::{CatchResultExt, Context, Ctx, Function, Object, Runtime, Value};
 use std::cell::RefCell;
-use std::path::Path;
 use std::rc::Rc;
+use std::path::Path;
 
-/// AST-based custom detector: a Rhai script loaded via --rules.
+/// AST-based custom detector: a JavaScript rule loaded via --rules.
 ///
-/// Modeled on solhint custom rules: the script declares metadata as constants
+/// Modeled on solhint custom rules: the script declares metadata constants
 /// and subscribes to AST node types by defining visitor functions. Each
-/// visitor receives the node as a map mirroring the IR (src/ir.rs), with a
-/// `span` carrying line/column. Findings are reported with `report(node, msg)`
-/// or `report(line, msg)`.
+/// visitor receives the node as an object mirroring the IR (src/ir.rs), with
+/// a `span` carrying line/column. Findings are reported with
+/// `report(node, msg)` or `report(line, msg)`.
 ///
 /// const NAME = "no-foo-template";
 /// const SEVERITY = "medium";
 /// const DESCRIPTION = "Templates cannot be named Foo";   // optional
 ///
-/// fn on_template(template) {
-///     if template.name == "Foo" {
+/// function on_template(template) {
+///     if (template.name === "Foo") {
 ///         report(template, "Templates cannot be named Foo");
 ///     }
 /// }
 ///
-/// Visitors: on_template(template), on_choice(choice [, template]),
-/// on_field(field [, template]), on_function(function), on_import(import),
-/// and check(module) for whole-module logic.
+/// Visitors: on_template(template), on_choice(choice, template),
+/// on_field(field, template), on_function(function), on_import(import),
+/// and check(module) for whole-module logic. Visitors must be `function`
+/// declarations (arrow functions assigned to const are not discovered).
 const VISITORS: &[&str] = &[
     "on_template",
     "on_choice",
@@ -35,6 +36,10 @@ const VISITORS: &[&str] = &[
     "check",
 ];
 
+/// Interrupt-handler invocations before a script is killed. QuickJS calls the
+/// handler periodically during execution; a runaway loop must not hang CI.
+const MAX_INTERRUPT_CHECKS: u64 = 100_000;
+
 pub struct ScriptDetector {
     name: String,
     severity: Severity,
@@ -43,164 +48,180 @@ pub struct ScriptDetector {
     path: String,
 }
 
-fn new_engine() -> Engine {
-    let mut engine = Engine::new();
-    // Debug builds halve rhai's default expression-depth limits, rejecting
-    // ordinary nested rules — lift the limit, scripts are trusted code.
-    engine.set_max_expr_depths(0, 0);
-    // ...but a rule with an infinite loop must not hang CI forever.
-    engine.set_max_operations(10_000_000);
-    // IR node maps always contain every key, so a missing property is a typo —
-    // fail loud instead of silently evaluating to ().
-    engine.set_fail_on_invalid_map_property(true);
-    engine
+fn new_runtime() -> Result<Runtime, String> {
+    let rt = Runtime::new().map_err(|e| e.to_string())?;
+    let count = std::cell::Cell::new(0u64);
+    rt.set_interrupt_handler(Some(Box::new(move || {
+        count.set(count.get() + 1);
+        count.get() > MAX_INTERRUPT_CHECKS
+    })));
+    Ok(rt)
+}
+
+/// Read a top-level string constant. `const` bindings are lexical, not
+/// globalThis properties, so they're read by evaluating an expression.
+fn read_const(ctx: &Ctx, name: &str) -> Option<String> {
+    ctx.eval::<Option<String>, _>(format!("typeof {n} === 'string' ? {n} : null", n = name))
+        .ok()
+        .flatten()
+}
+
+fn invoke<'js, A: rquickjs::function::IntoArgs<'js>>(
+    ctx: &Ctx<'js>,
+    rule: &str,
+    f: &Function<'js>,
+    visitor: &str,
+    args: A,
+) -> Result<(), String> {
+    f.call::<_, ()>(args)
+        .catch(ctx)
+        .map_err(|e| format!("rule '{}': {} failed: {}", rule, visitor, e))
+}
+
+fn parse_node<'js>(ctx: &Ctx<'js>, rule: &str, json: String) -> Result<Value<'js>, String> {
+    ctx.json_parse(json)
+        .catch(ctx)
+        .map_err(|e| format!("rule '{}': {}", rule, e))
 }
 
 pub fn load_script(path: &Path) -> Result<Box<dyn Detector>, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read rules script {}: {}", path.display(), e))?;
 
-    let engine = new_engine();
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("invalid rules script {}: {}", path.display(), e))?;
+    let rt = new_runtime()?;
+    let context = Context::full(&rt).map_err(|e| e.to_string())?;
+    context.with(|ctx| {
+        // report() must exist at load time so top-level code referencing it parses.
+        register_report(&ctx, Rc::new(RefCell::new(Vec::new())))?;
+        ctx.eval::<(), _>(source.as_bytes())
+            .catch(&ctx)
+            .map_err(|e| format!("invalid rules script {}: {}", path.display(), e))?;
 
-    // Run the top level to populate the constants.
-    let mut scope = Scope::new();
-    engine
-        .run_ast_with_scope(&mut scope, &ast)
-        .map_err(|e| format!("rules script {} failed: {}", path.display(), e))?;
+        let name = read_const(&ctx, "NAME").ok_or_else(|| {
+            format!("rules script {}: missing `const NAME = \"...\"`", path.display())
+        })?;
+        let severity_str = read_const(&ctx, "SEVERITY").ok_or_else(|| {
+            format!("rules script {}: missing `const SEVERITY = \"...\"`", path.display())
+        })?;
+        let severity = parse_severity(&severity_str).ok_or_else(|| {
+            format!(
+                "rule '{}': unknown severity '{}'. Use critical, high, medium, low, or info.",
+                name, severity_str
+            )
+        })?;
+        let description = read_const(&ctx, "DESCRIPTION").unwrap_or_default();
 
-    let name: String = scope
-        .get_value("NAME")
-        .ok_or_else(|| format!("rules script {}: missing `const NAME = \"...\"`", path.display()))?;
-    let severity_str: String = scope.get_value("SEVERITY").ok_or_else(|| {
-        format!("rules script {}: missing `const SEVERITY = \"...\"`", path.display())
-    })?;
-    let severity = parse_severity(&severity_str).ok_or_else(|| {
-        format!(
-            "rule '{}': unknown severity '{}'. Use critical, high, medium, low, or info.",
-            name, severity_str
-        )
-    })?;
-    let description: String = scope.get_value("DESCRIPTION").unwrap_or_default();
-
-    let has_visitor = ast
-        .iter_functions()
-        .any(|f| VISITORS.contains(&f.name));
-    if !has_visitor {
-        return Err(format!(
-            "rule '{}': script defines none of the visitor functions ({})",
-            name,
-            VISITORS.join(", ")
-        ));
-    }
-    // A visitor with the wrong arity would silently never be called.
-    for f in ast.iter_functions() {
-        if !VISITORS.contains(&f.name) {
-            continue;
-        }
-        let two_arg_ok = matches!(f.name, "on_choice" | "on_field");
-        if f.params.len() != 1 && !(two_arg_ok && f.params.len() == 2) {
+        let globals = ctx.globals();
+        let has_visitor = VISITORS
+            .iter()
+            .any(|v| globals.get::<_, Function>(*v).is_ok());
+        if !has_visitor {
             return Err(format!(
-                "rule '{}': {} takes {} parameter(s) — expected 1{}",
+                "rule '{}': script defines none of the visitor functions ({})",
                 name,
-                f.name,
-                f.params.len(),
-                if two_arg_ok { " or 2" } else { "" }
+                VISITORS.join(", ")
             ));
         }
-    }
 
-    Ok(Box::new(ScriptDetector {
-        name,
-        severity,
-        description,
-        source,
-        path: path.display().to_string(),
-    }))
+        Ok(Box::new(ScriptDetector {
+            name,
+            severity,
+            description,
+            source,
+            path: path.display().to_string(),
+        }) as Box<dyn Detector>)
+    })
 }
 
 /// (line, column, message) reported by the script.
 type Reported = Rc<RefCell<Vec<(usize, usize, String)>>>;
 
+fn json<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(v).expect("IR types always serialize")
+}
+
+fn register_report(ctx: &Ctx, sink: Reported) -> Result<(), String> {
+    let report = Function::new(ctx.clone(), move |arg: Value, message: String| {
+        let (line, column) = location_of(&arg);
+        sink.borrow_mut().push((line, column, message));
+    })
+    .map_err(|e| e.to_string())?;
+    ctx.globals()
+        .set("report", report)
+        .map_err(|e| e.to_string())
+}
+
+/// First argument of report(): a node object (location from its span) or a
+/// line number.
+fn location_of(arg: &Value) -> (usize, usize) {
+    if let Some(line) = arg.as_number() {
+        return ((line as i64).max(1) as usize, 1);
+    }
+    if let Some(obj) = arg.as_object() {
+        if let Ok(span) = obj.get::<_, Object>("span") {
+            let line: i64 = span.get("line").unwrap_or(1);
+            let column: i64 = span.get("column").unwrap_or(1);
+            return (line.max(1) as usize, column.max(1) as usize);
+        }
+    }
+    (1, 1)
+}
+
 impl ScriptDetector {
     fn run(&self, module: &DamlModule) -> Result<Vec<Finding>, String> {
         let reported: Reported = Rc::new(RefCell::new(Vec::new()));
 
-        let mut engine = new_engine();
-        let sink = reported.clone();
-        engine.register_fn("report", move |node: rhai::Map, message: &str| {
-            let (line, column) = span_of(&node);
-            sink.borrow_mut().push((line, column, message.to_string()));
-        });
-        let sink = reported.clone();
-        engine.register_fn("report", move |line: i64, message: &str| {
-            sink.borrow_mut().push((line.max(1) as usize, 1, message.to_string()));
-        });
+        let rt = new_runtime()?;
+        let context = Context::full(&rt).map_err(|e| e.to_string())?;
+        context.with(|ctx| -> Result<(), String> {
+            register_report(&ctx, reported.clone())?;
+            ctx.eval::<(), _>(self.source.as_bytes())
+                .catch(&ctx)
+                .map_err(|e| format!("rule '{}': {}", self.name, e))?;
 
-        let ast = engine
-            .compile(&self.source)
-            .map_err(|e| format!("rule '{}': {}", self.name, e))?;
-        let mut scope = Scope::new();
-        engine
-            .run_ast_with_scope(&mut scope, &ast)
-            .map_err(|e| format!("rule '{}': {}", self.name, e))?;
+            let globals = ctx.globals();
+            let visitor = |name: &str| globals.get::<_, Function>(name).ok();
+            let rule = self.name.as_str();
 
-        // Which visitors exist, by (name, arity)
-        let arities: Vec<(String, usize)> = ast
-            .iter_functions()
-            .map(|f| (f.name.to_string(), f.params.len()))
-            .collect();
-        let has = |name: &str, arity: usize| arities.iter().any(|(n, a)| n == name && *a == arity);
-        let call = |scope: &mut Scope, name: &str, args: Vec<Dynamic>| -> Result<(), String> {
-            // eval_ast(false): the top level already ran once above — without
-            // this, call_fn re-evaluates it before every visitor call.
-            let options = rhai::CallFnOptions::new().eval_ast(false);
-            engine
-                .call_fn_with_options::<Dynamic>(options, scope, &ast, name, args)
-                .map(|_| ())
-                .map_err(|e| format!("rule '{}': {} failed: {}", self.name, name, e))
-        };
-
-        for template in &module.templates {
-            let t_dyn = rhai::serde::to_dynamic(template).map_err(|e| e.to_string())?;
-            if has("on_template", 1) {
-                call(&mut scope, "on_template", vec![t_dyn.clone()])?;
-            }
-            for choice in &template.choices {
-                let c_dyn = rhai::serde::to_dynamic(choice).map_err(|e| e.to_string())?;
-                if has("on_choice", 2) {
-                    call(&mut scope, "on_choice", vec![c_dyn.clone(), t_dyn.clone()])?;
-                } else if has("on_choice", 1) {
-                    call(&mut scope, "on_choice", vec![c_dyn])?;
+            for template in &module.templates {
+                let t_json = json(template);
+                if let Some(f) = visitor("on_template") {
+                    let t = parse_node(&ctx, rule, t_json.clone())?;
+                    invoke(&ctx, rule, &f, "on_template", (t,))?;
+                }
+                if let Some(f) = visitor("on_choice") {
+                    for choice in &template.choices {
+                        let c = parse_node(&ctx, rule, json(choice))?;
+                        let t = parse_node(&ctx, rule, t_json.clone())?;
+                        invoke(&ctx, rule, &f, "on_choice", (c, t))?;
+                    }
+                }
+                if let Some(f) = visitor("on_field") {
+                    for field in &template.fields {
+                        let fd = parse_node(&ctx, rule, json(field))?;
+                        let t = parse_node(&ctx, rule, t_json.clone())?;
+                        invoke(&ctx, rule, &f, "on_field", (fd, t))?;
+                    }
                 }
             }
-            for field in &template.fields {
-                let f_dyn = rhai::serde::to_dynamic(field).map_err(|e| e.to_string())?;
-                if has("on_field", 2) {
-                    call(&mut scope, "on_field", vec![f_dyn.clone(), t_dyn.clone()])?;
-                } else if has("on_field", 1) {
-                    call(&mut scope, "on_field", vec![f_dyn])?;
+            if let Some(f) = visitor("on_function") {
+                for function in &module.functions {
+                    let fun = parse_node(&ctx, rule, json(function))?;
+                    invoke(&ctx, rule, &f, "on_function", (fun,))?;
                 }
             }
-        }
-        if has("on_function", 1) {
-            for function in &module.functions {
-                let f_dyn = rhai::serde::to_dynamic(function).map_err(|e| e.to_string())?;
-                call(&mut scope, "on_function", vec![f_dyn])?;
+            if let Some(f) = visitor("on_import") {
+                for import in &module.imports {
+                    let i = parse_node(&ctx, rule, json(import))?;
+                    invoke(&ctx, rule, &f, "on_import", (i,))?;
+                }
             }
-        }
-        if has("on_import", 1) {
-            for import in &module.imports {
-                let i_dyn = rhai::serde::to_dynamic(import).map_err(|e| e.to_string())?;
-                call(&mut scope, "on_import", vec![i_dyn])?;
+            if let Some(f) = visitor("check") {
+                let m = parse_node(&ctx, rule, json(module))?;
+                invoke(&ctx, rule, &f, "check", (m,))?;
             }
-        }
-        if has("check", 1) {
-            let m_dyn = rhai::serde::to_dynamic(module).map_err(|e| e.to_string())?;
-            call(&mut scope, "check", vec![m_dyn])?;
-        }
+            Ok(())
+        })?;
 
         let findings = reported
             .borrow()
@@ -222,16 +243,6 @@ impl ScriptDetector {
             })
             .collect();
         Ok(findings)
-    }
-}
-
-fn span_of(node: &rhai::Map) -> (usize, usize) {
-    if let Some(span) = node.get("span").and_then(|s| s.read_lock::<rhai::Map>()) {
-        let line = span.get("line").and_then(|v| v.as_int().ok()).unwrap_or(1);
-        let column = span.get("column").and_then(|v| v.as_int().ok()).unwrap_or(1);
-        (line.max(1) as usize, column.max(1) as usize)
-    } else {
-        (1, 1)
     }
 }
 
@@ -266,7 +277,7 @@ mod tests {
 
     fn load_script_from_str(label: &str, script: &str) -> Result<Box<dyn Detector>, String> {
         let path = std::env::temp_dir().join(format!(
-            "daml-lint-test-{}-{}.rhai",
+            "daml-lint-test-{}-{}.js",
             label,
             std::process::id()
         ));
@@ -301,8 +312,8 @@ template Iou
 const NAME = "template-requires-ensure";
 const SEVERITY = "medium";
 
-fn on_template(template) {
-    if template.ensure_clause == () {
+function on_template(template) {
+    if (template.ensure_clause === null) {
         report(template, `Template '${template.name}' has no ensure clause`);
     }
 }
@@ -324,14 +335,12 @@ fn on_template(template) {
 const NAME = "consuming-choice-signatory-controller";
 const SEVERITY = "medium";
 
-fn on_choice(choice, template) {
-    if !choice.consuming {
+function on_choice(choice, template) {
+    if (!choice.consuming) {
         return;
     }
-    for controller in choice.controllers {
-        if controller in template.signatories {
-            return;
-        }
+    if (choice.controllers.some(c => template.signatories.includes(c))) {
+        return;
     }
     report(choice, `Consuming choice '${choice.name}' has no signatory controller`);
 }
@@ -352,9 +361,9 @@ fn on_choice(choice, template) {
 const NAME = "max-one-template";
 const SEVERITY = "low";
 
-fn check(m) {
-    if m.templates.len() > 0 {
-        report(1, `Module '${m.name}' has templates`);
+function check(module) {
+    if (module.templates.length > 0) {
+        report(1, `Module '${module.name}' has templates`);
     }
 }
 "#,
@@ -367,12 +376,34 @@ fn check(m) {
     }
 
     #[test]
+    fn test_statement_bodies_inspectable() {
+        let det = load_script_from_str(
+            "statements",
+            r#"
+const NAME = "no-create-in-choice";
+const SEVERITY = "low";
+
+function on_choice(choice) {
+    for (const stmt of choice.body) {
+        if ("Create" in stmt) {
+            report(choice, `Choice '${choice.name}' creates contracts`);
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let module = parse_daml(TEMPLATE_NO_ENSURE, Path::new("Test.daml"));
+        det.detect(&module);
+    }
+
+    #[test]
     fn test_missing_name_rejected() {
         let result = load_script_from_str(
             "no-name",
             r#"
 const SEVERITY = "low";
-fn on_template(t) {}
+function on_template(t) {}
 "#,
         );
         assert!(result.is_err());
@@ -391,57 +422,66 @@ const SEVERITY = "low";
     }
 
     #[test]
-    fn test_wrong_arity_visitor_rejected() {
+    fn test_bad_severity_rejected() {
         let result = load_script_from_str(
-            "arity",
+            "bad-severity",
             r#"
 const NAME = "x";
-const SEVERITY = "low";
-fn on_choice(c, t, extra) {}
+const SEVERITY = "banana";
+function on_template(t) {}
 "#,
         );
         match result {
-            Err(e) => assert!(e.contains("expected 1 or 2")),
-            Ok(_) => panic!("3-parameter visitor should be rejected, not silently ignored"),
+            Err(e) => assert!(e.contains("banana")),
+            Ok(_) => panic!("bad severity should be rejected"),
         }
-    }
-
-    #[test]
-    fn test_nested_expressions_compile() {
-        // Debug builds halve rhai's expression-depth limits; this README-shaped
-        // rule must compile in both profiles.
-        let det = load_script_from_str(
-            "nested",
-            r#"
-const NAME = "nested";
-const SEVERITY = "low";
-
-fn on_choice(choice) {
-    for stmt in choice.body {
-        if stmt.contains("Create") {
-            report(choice, `Choice '${choice.name}' creates contracts`);
-        }
-    }
-}
-"#,
-        )
-        .unwrap();
-        let module = parse_daml(TEMPLATE_NO_ENSURE, Path::new("Test.daml"));
-        det.detect(&module);
     }
 
     #[test]
     fn test_syntax_error_rejected() {
-        let result = load_script_from_str("syntax-err", "fn on_template(t) {");
+        let result = load_script_from_str("syntax-err", "function on_template(t) {");
         assert!(result.is_err());
     }
 
     #[test]
+    fn test_runtime_error_surfaces_rule_and_visitor() {
+        let script = ScriptDetector {
+            name: "boom".to_string(),
+            severity: Severity::Low,
+            description: String::new(),
+            source: r#"function on_template(t) { t.does.not.exist; }"#.to_string(),
+            path: "test.js".to_string(),
+        };
+        let module = parse_daml(TEMPLATE_NO_ENSURE, Path::new("Test.daml"));
+        let err = script.run(&module).unwrap_err();
+        assert!(err.contains("boom"));
+        assert!(err.contains("on_template"));
+    }
+
+    #[test]
+    fn test_infinite_loop_interrupted() {
+        let script = ScriptDetector {
+            name: "spin".to_string(),
+            severity: Severity::Low,
+            description: String::new(),
+            source: r#"
+const NAME = "spin";
+const SEVERITY = "low";
+function on_template(t) { while (true) {} }
+"#
+            .to_string(),
+            path: "spin.js".to_string(),
+        };
+        let module = parse_daml(TEMPLATE_NO_ENSURE, Path::new("Test.daml"));
+        assert!(script.run(&module).is_err());
+    }
+
+    #[test]
     fn test_demo_scripts_load() {
-        assert!(load_script(Path::new("examples/template-requires-ensure.rhai")).is_ok());
+        assert!(load_script(Path::new("examples/template-requires-ensure.js")).is_ok());
         assert!(
-            load_script(Path::new("examples/consuming-choice-signatory-controller.rhai")).is_ok()
+            load_script(Path::new("examples/consuming-choice-signatory-controller.js")).is_ok()
         );
-        assert!(load_script(Path::new("examples/no-trace.rhai")).is_ok());
+        assert!(load_script(Path::new("examples/no-trace.js")).is_ok());
     }
 }

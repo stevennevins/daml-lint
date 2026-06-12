@@ -30,7 +30,8 @@ struct Cli {
     #[arg(long, default_value = "high")]
     fail_on: String,
 
-    /// Custom AST rule scripts (.rhai), repeatable. See examples/*.rhai
+    /// Custom AST rule scripts (JavaScript), repeatable. Write in TypeScript
+    /// against examples/daml-lint.d.ts and compile; see examples/
     #[arg(long)]
     rules: Vec<PathBuf>,
 }

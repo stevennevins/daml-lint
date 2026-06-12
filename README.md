@@ -62,46 +62,58 @@ Define your own detectors as AST rule scripts and pass them with `--rules`
 (repeatable), in the style of [solhint custom rules](https://github.com/protofire/solhint/blob/master/docs/writing-plugins.md):
 
 ```sh
-daml-lint ./daml/ --rules my-rule.rhai --rules another-rule.rhai
+daml-lint ./daml/ --rules my-rule.js --rules another-rule.js
 ```
 
-A rule is a [Rhai](https://rhai.rs) script: constants for metadata, plus visitor
-functions named after the node types you care about — like solhint's
-`ContractDefinition(node)` callbacks:
+A rule is TypeScript/JavaScript (executed by an embedded QuickJS engine):
+constants for metadata, plus visitor functions named after the node types you
+care about — like solhint's `ContractDefinition(node)` callbacks. Write rules
+in TypeScript against [examples/daml-lint.d.ts](examples/daml-lint.d.ts) for
+type checking and autocomplete:
 
-```rhai
+```typescript
 const NAME = "template-requires-ensure";
 const SEVERITY = "medium";
 const DESCRIPTION = "Every template must declare an ensure clause";   // optional
 
-fn on_template(template) {
-    if template.ensure_clause == () {
-        report(template, `Template '${template.name}' has no ensure clause`);
-    }
+function on_template(template: Template): void {
+  if (template.ensure_clause === null) {
+    report(template, `Template '${template.name}' has no ensure clause`);
+  }
 }
 ```
+
+then compile to the JavaScript file you pass to `--rules`:
+
+```sh
+npx esbuild my-rule.ts --outfile=my-rule.js   # or tsc
+```
+
+(Plain JavaScript rules work directly — the compile step is only for TypeScript.)
 
 Visitors (define any subset, at least one):
 
 | Function | Called for | Node fields |
 |---|---|---|
-| `on_template(template)` | each template | `name`, `fields`, `signatories`, `observers`, `ensure_clause` (`()` if absent), `choices`, `span` |
-| `on_choice(choice [, template])` | each choice | `name`, `consuming`, `controllers`, `parameters`, `return_type`, `body`, `body_raw`, `span` |
-| `on_field(field [, template])` | each template field | `name`, `type_`, `span` |
+| `on_template(template)` | each template | `name`, `fields`, `signatories`, `observers`, `ensure_clause` (`null` if absent), `choices`, `span` |
+| `on_choice(choice, template)` | each choice | `name`, `consuming`, `controllers`, `parameters`, `return_type`, `body`, `body_raw`, `span` |
+| `on_field(field, template)` | each template field | `name`, `type_`, `span` |
 | `on_function(function)` | each top-level function | `name`, `body`, `body_raw`, `span` |
 | `on_import(import)` | each import | `module_name`, `qualified`, `alias` |
 | `check(m)` | once per module | `name`, `file`, `imports`, `templates`, `functions`, `source` |
 
 Report findings with `report(node, message)` (location taken from the node's
 `span`) or `report(line, message)`. The rule's `SEVERITY` applies to all its
-findings. Node shapes mirror the IR in [src/ir.rs](src/ir.rs); statement nodes
-in `body` are maps keyed by kind, e.g. `stmt.contains("Create")`.
+findings. Node shapes are declared in
+[examples/daml-lint.d.ts](examples/daml-lint.d.ts) and mirror the IR in
+[src/ir.rs](src/ir.rs); statement nodes in `body` are objects keyed by kind,
+e.g. `"Create" in stmt`.
 
-Heads up: `module` is a reserved word in Rhai — name your `check` parameter
-something else (e.g. `m`). If a script fails at runtime the scan aborts with
-exit code 2; rule errors are never swallowed. Accessing a property that
-doesn't exist on a node is an error (catches typos), and scripts are capped
-at 10M operations per module so a runaway loop can't hang CI.
+Heads up: visitors must be `function` declarations — arrow functions assigned
+to `const` are not discovered. If a script fails at runtime the scan aborts
+with exit code 2; rule errors are never swallowed. A runaway loop is
+interrupted so a broken rule can't hang CI. The engine runs JavaScript
+(ES2023) — no Node APIs, no `require`/`import`, no filesystem or network.
 
 `SEVERITY` is one of `critical`, `high`, `medium`, `low`, `info`. Custom rules
 run alongside the built-in detectors, appear in all output formats, and count
@@ -110,9 +122,12 @@ or each other.
 
 Examples:
 
-- [examples/template-requires-ensure.rhai](examples/template-requires-ensure.rhai) — structural check on a single node
-- [examples/consuming-choice-signatory-controller.rhai](examples/consuming-choice-signatory-controller.rhai) — cross-references choice controllers against template signatories
-- [examples/no-trace.rhai](examples/no-trace.rhai) — banned-token check over raw source lines
+- [examples/template-requires-ensure.ts](examples/template-requires-ensure.ts) — structural check on a single node
+- [examples/consuming-choice-signatory-controller.ts](examples/consuming-choice-signatory-controller.ts) — cross-references choice controllers against template signatories
+- [examples/no-trace.ts](examples/no-trace.ts) — banned-token check over raw source lines
+
+Each example ships with its compiled `.js` next to it — that's the file
+`--rules` takes.
 
 To check that a rule script parses without running a scan, point the tool at a nonexistent path — rule errors are reported before file discovery. (A valid script then prints `No .daml files found.`, which also exits 2 — go by the message, not the exit code.)
 
