@@ -10,9 +10,34 @@ interface Span {
   column: number;
 }
 
-/** Builtin scalar types serialize as strings ("Party", "Decimal", ...);
- *  parameterized types as single-key objects ({ List: "Party" }, { ContractId: ... }). */
-type DamlType = string | { [kind: string]: DamlType | DamlType[] };
+/** DAML types as parsed by daml-lint.
+ *
+ *  Builtin scalar types serialize as bare strings: "Party", "Text",
+ *  "Decimal", "Int", "Bool", "Date", "Time", "Unit" (for `()`), and
+ *  "Unknown" (anything the parser could not classify, e.g. tuples).
+ *
+ *  Parameterized types are single-key objects whose value is the inner
+ *  type: { List: "Text" }, { Optional: "Party" }, { TextMap: "Int" },
+ *  { ContractId: { Named: "Iou" } }.
+ *
+ *  User-defined / unrecognized capitalized types are { Named: "..." }
+ *  where the payload is the raw type text (a string, NOT a DamlType) —
+ *  e.g. { Named: "Iou" } or { Named: "Map.Map Party Decimal" }. */
+type DamlType =
+  | "Party"
+  | "Text"
+  | "Decimal"
+  | "Int"
+  | "Bool"
+  | "Date"
+  | "Time"
+  | "Unit"
+  | "Unknown"
+  | { ContractId: DamlType }
+  | { List: DamlType }
+  | { Optional: DamlType }
+  | { TextMap: DamlType }
+  | { Named: string };
 
 interface Field {
   name: string;
@@ -25,10 +50,20 @@ interface EnsureClause {
   span: Span;
 }
 
-/** Statements are single-key objects tagged by kind:
- *  { Let: {...} } | { Assert: {...} } | { Fetch: {...} } | { Archive: {...} } |
- *  { Create: {...} } | { Exercise: {...} } | { TryCatch: {...} } | { Other: {...} } */
-type Statement = { [kind: string]: unknown };
+/** Statements are single-key objects tagged by kind. Use the tag as a
+ *  discriminant: `if ("Create" in stmt) { stmt.Create.template_name ... }`.
+ *  Expression payloads (`expr`, `condition`, `raw`, ...) are raw source
+ *  text; `template_name`, `cid_expr`, and `choice_name` may be "" when
+ *  the parser cannot extract them. */
+type Statement =
+  | { Let: { name: string; expr: string } }
+  | { Assert: { condition: string } }
+  | { Fetch: { cid_expr: string } }
+  | { Archive: { cid_expr: string } }
+  | { Create: { template_name: string; raw: string } }
+  | { Exercise: { cid_expr: string; choice_name: string; raw: string } }
+  | { TryCatch: { try_body: Statement[]; catch_body: Statement[] } }
+  | { Other: { raw: string } };
 
 interface Choice {
   name: string;

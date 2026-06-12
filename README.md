@@ -124,6 +124,7 @@ Examples:
 
 - [examples/template-requires-ensure.ts](examples/template-requires-ensure.ts) — structural check on a single node
 - [examples/consuming-choice-signatory-controller.ts](examples/consuming-choice-signatory-controller.ts) — cross-references choice controllers against template signatories
+- [examples/no-create-in-nonconsuming.ts](examples/no-create-in-nonconsuming.ts) — walks choice body statements, recursing into try/catch
 - [examples/no-trace.ts](examples/no-trace.ts) — banned-token check over raw source lines
 
 Each example ships with its compiled `.js` next to it — that's the file

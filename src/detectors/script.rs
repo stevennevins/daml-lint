@@ -476,6 +476,137 @@ function on_template(t) { while (true) {} }
         assert!(script.run(&module).is_err());
     }
 
+    /// Exercises every script-visible node kind: all scalar and parameterized
+    /// field types, ensure clauses, choice parameters, nonconsuming choices,
+    /// every Statement variant (with TryCatch recursion), qualified aliased
+    /// imports, and top-level functions.
+    #[test]
+    fn test_every_node_kind_reaches_scripts() {
+        let probe = r#"module Probe where
+
+import qualified DA.Map as Map
+import DA.Time
+
+template Probe
+  with
+    owner : Party
+    note : Text
+    amount : Decimal
+    count : Int
+    active : Bool
+    issued : Date
+    stamp : Time
+    tags : [Text]
+    backup : Optional Party
+    parent : ContractId Probe
+    scores : TextMap Int
+    extra : Custom
+  where
+    signatory owner
+    ensure amount > 0.0
+
+    choice Reissue : ContractId Probe
+      with
+        newOwner : Party
+      controller owner
+      do
+        let total = amount + 1.0
+        assert (total > 0.0)
+        p <- fetch parent
+        archive parent
+        cid <- create this with owner = newOwner
+        result <- exercise cid Noop
+        try do
+          pure ()
+        catch
+          (e : AnyException) -> pure ()
+        pure cid
+
+    nonconsuming choice Noop : ()
+      controller owner
+      do
+        pure ()
+
+helper x = x + 1
+"#;
+        let det = load_script_from_str(
+            "census",
+            r#"
+const NAME = "node-census";
+const SEVERITY = "info";
+
+function stmtKinds(stmts, seen) {
+  for (const s of stmts) {
+    const k = Object.keys(s)[0];
+    seen.add(k);
+    if (k === "TryCatch") {
+      stmtKinds(s.TryCatch.try_body, seen);
+      stmtKinds(s.TryCatch.catch_body, seen);
+    }
+  }
+}
+
+function check(m) {
+  const seen = new Set();
+  for (const t of m.templates) {
+    if (t.ensure_clause !== null) seen.add("Ensure");
+    for (const f of t.fields) {
+      if (typeof f.type_ === "string") seen.add("Scalar:" + f.type_);
+      else seen.add("Param:" + Object.keys(f.type_)[0]);
+    }
+    for (const c of t.choices) {
+      if (c.parameters.length > 0) seen.add("ChoiceParams");
+      if (!c.consuming) seen.add("Nonconsuming");
+      stmtKinds(c.body, seen);
+    }
+  }
+  for (const i of m.imports) {
+    if (i.qualified && i.alias !== null) seen.add("QualifiedAlias");
+  }
+  if (m.functions.length > 0) seen.add("Function");
+  for (const k of Array.from(seen).sort()) report(1, k);
+}
+"#,
+        )
+        .unwrap();
+        let module = parse_daml(probe, Path::new("Probe.daml"));
+        let seen: Vec<String> = det.detect(&module).into_iter().map(|f| f.message).collect();
+
+        for expected in [
+            "Scalar:Party",
+            "Scalar:Text",
+            "Scalar:Decimal",
+            "Scalar:Int",
+            "Scalar:Bool",
+            "Scalar:Date",
+            "Scalar:Time",
+            "Param:List",
+            "Param:Optional",
+            "Param:ContractId",
+            "Param:TextMap",
+            "Param:Named",
+            "Ensure",
+            "ChoiceParams",
+            "Nonconsuming",
+            "Let",
+            "Assert",
+            "Fetch",
+            "Archive",
+            "Create",
+            "Exercise",
+            "TryCatch",
+            "QualifiedAlias",
+            "Function",
+        ] {
+            assert!(
+                seen.iter().any(|m| m == expected),
+                "node kind '{}' did not reach the script; saw: {:?}",
+                expected,
+                seen
+            );
+        }
+    }
+
     #[test]
     fn test_demo_scripts_load() {
         assert!(load_script(Path::new("examples/template-requires-ensure.js")).is_ok());
