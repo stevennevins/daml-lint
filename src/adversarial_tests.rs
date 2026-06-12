@@ -244,6 +244,96 @@ fn empty_with_block_before_controller() {
     assert!(c.parameters.is_empty());
 }
 
+/// Syntax found in the daml SDK corpus that tree-sitter-daml parses and we
+/// initially did not — each construct here regressed once.
+#[test]
+fn sdk_corpus_syntax_gaps() {
+    // View patterns: `(expr -> pat)` discards the view expression.
+    let m = parse(concat!(
+        "module M where\n",
+        "f (T.isInfixOf \"x\" -> True) = 1\n",
+        "f (fromAny @T1 -> Some cid) = 2\n",
+    ));
+    assert_eq!(m.functions.len(), 1, "view-pattern equations merge");
+
+    // Annotated parameter whose type contains `->` is NOT a view pattern.
+    let m = parse(concat!(
+        "module M where\n",
+        "applyFilter (filter : Int -> Int -> Bool) (xs : [Int]) : [Int] = xs\n",
+    ));
+    assert_eq!(m.functions.len(), 1);
+    assert!(m.functions[0].name == "applyFilter");
+
+    // Lambda-case and lazy patterns.
+    let m = parse(concat!(
+        "module M where\n",
+        "f = \\case\n",
+        "    x :: _ -> x\n",
+        "    [] -> 0\n",
+        "g = foldr (\\(a, b) ~(as, bs) -> (a :: as, b :: bs)) ([], [])\n",
+    ));
+    assert_eq!(m.functions.len(), 2);
+
+    // Infix operator equations with pattern operands: skipped, no
+    // diagnostics, and surrounding declarations survive.
+    let m = parse(concat!(
+        "module M where\n",
+        "[] !! _ = error \"index\"\n",
+        "(x :: _) !! 0 = x\n",
+        "None <?> s = invalid s\n",
+        "Some v <?> _ = pure v\n",
+        "after = 1\n",
+    ));
+    assert!(m.functions.iter().any(|f| f.name == "after"));
+
+    // Comma-separated and pattern guards in case alternatives.
+    let m = parse(concat!(
+        "module M where\n",
+        "f x = case x of\n",
+        "  Left cmd\n",
+        "    | cmd.name == \"Submit\"\n",
+        "    , Some y <- cmd.detail\n",
+        "    -> y\n",
+        "  _ -> 0\n",
+    ));
+    assert_eq!(m.functions.len(), 1);
+
+    // Single-line template: inline with-block closed by `where`.
+    let m = parse(concat!(
+        "module M where\n",
+        "template S with p : Party where\n",
+        "  signatory p\n",
+    ));
+    assert_eq!(m.templates.len(), 1);
+    assert_eq!(m.templates[0].fields.len(), 1);
+    assert_eq!(m.templates[0].signatories, vec!["p"]);
+
+    // Compact choice header: trailing `with`, controller dedented below
+    // where fields would sit; following choices must survive.
+    let m = parse(concat!(
+        "module M where\n",
+        "template T\n",
+        "  with\n",
+        "    p : Party\n",
+        "  where\n",
+        "    signatory p\n",
+        "    choice Ham : ContractId T with\n",
+        "      controller p\n",
+        "      do pure self\n",
+        "    choice Spam : () with\n",
+        "        extra : Party\n",
+        "      controller p\n",
+        "      do pure ()\n",
+    ));
+    let names: Vec<&str> = m.templates[0]
+        .choices
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Ham", "Spam"]);
+    assert_eq!(m.templates[0].choices[1].parameters.len(), 1);
+}
+
 #[test]
 fn huge_single_line() {
     let mut src = String::from("module M where\nf = ");

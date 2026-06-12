@@ -236,9 +236,37 @@ impl Parser {
         }
     }
 
+    /// If the cursor sits on an infix operator equation with a pattern
+    /// left operand (`[] !! _ = ...`, `None <?> s = ...`), skip it and
+    /// return true. Operators have no IR surface.
+    fn try_infix_operator_decl(&mut self) -> bool {
+        let snap = self.i;
+        let saved_diags = self.diags.len();
+        if self.pattern().is_some()
+            && matches!(self.peek(), Some(Tok::Op(o)) if !is_reserved_op(o))
+        {
+            self.skip_to_item_end();
+            return true;
+        }
+        self.i = snap;
+        self.diags.truncate(saved_diags);
+        false
+    }
+
     fn declaration(&mut self, imports: &mut Vec<ImportDecl>, decls: &mut Vec<Decl>) {
         let pos = self.pos();
         let start = self.i;
+        if matches!(
+            self.peek(),
+            Some(Tok::UpperId { .. } | Tok::LBracket | Tok::LParen)
+        ) && self.try_infix_operator_decl()
+        {
+            decls.push(Decl::Unknown {
+                raw: self.slice_text(start),
+                pos,
+            });
+            return;
+        }
         match self.peek() {
             Some(t) if t.is_keyword("import") => {
                 if let Some(imp) = self.import_decl() {
@@ -419,7 +447,7 @@ impl Parser {
 
         let mut fields = Vec::new();
         if self.eat_keyword("with") {
-            fields = self.field_block();
+            (fields, _) = self.field_block();
         }
         let mut body = Vec::new();
         if self.eat_keyword("where") {
@@ -434,10 +462,14 @@ impl Parser {
     }
 
     /// `{ name : Type ; name2, name3 : Type ; ... }` (virtual or explicit).
-    fn field_block(&mut self) -> Vec<FieldDecl> {
+    /// Returns the fields plus a "dangling" flag: true when the block was
+    /// entered but abandoned early because its first item is not a field
+    /// (an empty `with` whose layout block swallowed the next clause) —
+    /// the caller must discard the block's eventual closing VRBrace.
+    fn field_block(&mut self) -> (Vec<FieldDecl>, bool) {
         let mut fields = Vec::new();
         if !(self.eat(&Tok::VLBrace) || self.eat(&Tok::LBrace)) {
-            return fields;
+            return (fields, false);
         }
         loop {
             while self.eat(&Tok::VSemi) || self.eat(&Tok::Semi) {}
@@ -476,7 +508,7 @@ impl Parser {
                 let is_field = j > self.i
                     && self.toks.get(j).map(|t| &t.tok).is_some_and(|t| t.is_op(":"));
                 if !is_field {
-                    break;
+                    return (fields, true);
                 }
             }
             let before = self.i;
@@ -515,7 +547,7 @@ impl Parser {
                 });
             }
         }
-        fields
+        (fields, false)
     }
 
     fn template_body(&mut self) -> Vec<TemplateBodyDecl> {
@@ -681,12 +713,19 @@ impl Parser {
             return_type_text = self.slice_text(ty_start);
         }
         let mut params = Vec::new();
+        let mut dangling = false;
         if self.eat_keyword("with") {
-            params = self.field_block();
+            (params, dangling) = self.field_block();
         }
         let mut observers = Vec::new();
         let mut controllers = Vec::new();
         loop {
+            // Inside a dangling (empty) with-block the controller/observer/
+            // do clauses sit at the block's column, so layout separates
+            // them with virtual semicolons — consume those.
+            if dangling {
+                while self.eat(&Tok::VSemi) {}
+            }
             if self.eat_keyword("observer") {
                 observers = self.expr_comma_list_no_do();
             } else if self.eat_keyword("controller") {
@@ -694,6 +733,9 @@ impl Parser {
             } else {
                 break;
             }
+        }
+        if dangling {
+            while self.eat(&Tok::VSemi) {}
         }
         let body = if self.peek().is_some_and(|t| {
             !matches!(t, Tok::VSemi | Tok::VRBrace | Tok::Semi | Tok::RBrace)
@@ -704,6 +746,12 @@ impl Parser {
         };
         let end_line = self.prev_line();
         self.skip_to_item_end();
+        if dangling {
+            // Discard the abandoned with-block's closing brace so it does
+            // not terminate the enclosing template/interface body.
+            self.eat(&Tok::VRBrace);
+            self.skip_to_item_end();
+        }
         Some(ChoiceDecl {
             name,
             consuming,
@@ -1142,6 +1190,12 @@ impl Parser {
                 }
                 continue;
             }
+            // Infix operator binding with a pattern operand:
+            // `None <?> s = ...` in a where/let block.
+            if matches!(self.peek(), Some(Tok::Op(o)) if !is_reserved_op(o)) {
+                self.skip_to_item_end();
+                return None;
+            }
             match self.peek() {
                 None | Some(Tok::VSemi) | Some(Tok::VRBrace) | Some(Tok::Semi)
                 | Some(Tok::RBrace) => return None,
@@ -1165,6 +1219,11 @@ impl Parser {
 
     fn pattern_atom_inner(&mut self) -> Option<Pat> {
         let pos = self.pos();
+        // Lazy / strict pattern markers: `~(as, bs)`, `!x`.
+        if self.at_op("~") || self.at_op("!") {
+            self.bump();
+            return self.pattern_atom();
+        }
         match self.peek().cloned() {
             Some(Tok::LowerId {
                 qualifier: None,
@@ -1246,6 +1305,43 @@ impl Parser {
                         args: Vec::new(),
                         pos,
                     });
+                }
+                // View pattern `(expr -> pat)`: scan for a top-level `->`
+                // inside these parens; the expression side is discarded and
+                // the pattern after the arrow is the binding. A top-level
+                // `:` before the arrow means the arrow belongs to a type
+                // annotation (`(f : Int -> Bool)`), not a view pattern.
+                {
+                    let mut depth = 0usize;
+                    let mut j = self.i;
+                    let mut arrow = None;
+                    while let Some(t) = self.toks.get(j).map(|t| &t.tok) {
+                        match t {
+                            Tok::LParen | Tok::LBracket => depth += 1,
+                            Tok::RParen | Tok::RBracket => {
+                                if depth == 0 {
+                                    break;
+                                }
+                                depth -= 1;
+                            }
+                            Tok::Op(o) if o == ":" && depth == 0 => break,
+                            Tok::Op(o) if o == "->" && depth == 0 => {
+                                arrow = Some(j);
+                                break;
+                            }
+                            Tok::VSemi | Tok::VRBrace => break,
+                            // A lambda's arrow belongs to the lambda.
+                            Tok::Op(o) if o == "\\" => break,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if let Some(j) = arrow {
+                        self.i = j + 1; // skip the view expression and `->`
+                        let inner = self.pattern()?;
+                        self.eat(&Tok::RParen);
+                        return Some(inner);
+                    }
                 }
                 let first = self.pattern()?;
                 // Type-annotated pattern `(e : AnyException)`: skip the type.
@@ -1854,9 +1950,19 @@ impl Parser {
         let pat = self.pattern()?;
         if self.at_op("|") {
             // Guarded alternative(s): take the first body, consume all.
+            // Each guard is comma-separated qualifiers, each a boolean
+            // expression or a pattern guard `pat <- expr`.
             let mut first: Option<Expr> = None;
             while self.eat_op("|") {
-                let _guard = self.expr();
+                loop {
+                    let _guard = self.expr();
+                    if self.eat_op("<-") {
+                        let _ = self.expr();
+                    }
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
                 if !self.eat_op("->") {
                     self.diag("expected '->' in guarded case alternative");
                     return None;
@@ -2011,6 +2117,47 @@ impl Parser {
     fn lambda_expr(&mut self) -> Option<Expr> {
         let pos = self.pos();
         self.bump(); // backslash
+        // `\case` — lambda-case: one implicit argument matched by the alts.
+        if self.eat_keyword("case") {
+            let mut alts = Vec::new();
+            if self.eat(&Tok::VLBrace) || self.eat(&Tok::LBrace) {
+                loop {
+                    while self.eat(&Tok::VSemi) || self.eat(&Tok::Semi) {}
+                    match self.peek() {
+                        None => break,
+                        Some(Tok::VRBrace) | Some(Tok::RBrace) => {
+                            self.bump();
+                            break;
+                        }
+                        Some(Tok::RParen) | Some(Tok::RBracket) => {
+                            self.bump();
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    match self.case_alt() {
+                        Some(a) => alts.push(a),
+                        None => self.skip_to_item_end(),
+                    }
+                }
+            }
+            return Some(Expr::Lambda {
+                params: vec![Pat::Var {
+                    name: "_".to_string(),
+                    pos,
+                }],
+                body: Box::new(Expr::Case {
+                    scrutinee: Box::new(Expr::Var {
+                        qualifier: None,
+                        name: "_".to_string(),
+                        pos,
+                    }),
+                    alts,
+                    pos,
+                }),
+                pos,
+            });
+        }
         let mut params = Vec::new();
         while !self.at_op("->") {
             match self.pattern_atom() {

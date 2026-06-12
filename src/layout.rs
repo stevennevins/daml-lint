@@ -21,6 +21,8 @@ fn is_layout_keyword(tok: &Tok) -> bool {
 struct Context {
     /// Column of the block; 0 for an explicit `{ }` context (no offside).
     col: usize,
+    /// Line the block was opened on (same-line `where` closure rule).
+    line: usize,
     /// Keyword that opened it ("let" matters for the `in` rule).
     opened_by: &'static str,
     /// Bracket nesting depth at open time, so `)` can close blocks that
@@ -54,6 +56,7 @@ pub fn resolve_layout(tokens: Vec<Token>) -> Vec<Token> {
         if !first.tok.is_keyword("module") {
             stack.push(Context {
                 col: first.pos.column,
+                line: first.pos.line,
                 opened_by: "module",
                 bracket_depth: 0,
             });
@@ -75,6 +78,7 @@ pub fn resolve_layout(tokens: Vec<Token>) -> Vec<Token> {
                 // Explicit block: push a no-offside context.
                 stack.push(Context {
                     col: 0,
+                    line: pos.line,
                     opened_by: kw,
                     bracket_depth,
                 });
@@ -86,6 +90,7 @@ pub fn resolve_layout(tokens: Vec<Token>) -> Vec<Token> {
             if col > enclosing {
                 stack.push(Context {
                     col,
+                    line: pos.line,
                     opened_by: kw,
                     bracket_depth,
                 });
@@ -129,7 +134,14 @@ pub fn resolve_layout(tokens: Vec<Token>) -> Vec<Token> {
         // parse-error rule).
         if token.tok.is_keyword("where") {
             while let Some(top) = stack.last() {
-                if top.col > 0 && top.col >= col && top.opened_by != "module" {
+                // Close blocks at/right of the `where`, and with-blocks
+                // opened on the same line (`template S with p : Party
+                // where ...` — the inline with-block ends at the where).
+                if top.col > 0
+                    && (top.col >= col
+                        || (top.line == pos.line && top.opened_by == "with"))
+                    && top.opened_by != "module"
+                {
                     close(&mut out, pos);
                     stack.pop();
                 } else {
@@ -183,10 +195,16 @@ pub fn resolve_layout(tokens: Vec<Token>) -> Vec<Token> {
             _ => {}
         }
 
+        let was_backslash = out
+            .last()
+            .is_some_and(|t| matches!(&t.tok, Tok::Op(o) if o == "\\"));
         out.push(token.clone());
 
         if is_layout_keyword(&token.tok) {
             expecting_open = Some(opened_kw(&token.tok));
+        } else if token.tok.is_keyword("case") && was_backslash {
+            // `\case` alternatives form a layout block like `of`.
+            expecting_open = Some("of");
         }
     }
 
