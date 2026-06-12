@@ -1,4 +1,6 @@
 mod detector;
+mod lexer;
+mod layout;
 mod detectors;
 mod ir;
 mod parser;
