@@ -33,6 +33,7 @@ const VISITORS: &[&str] = &[
     "on_field",
     "on_function",
     "on_import",
+    "on_interface",
     "check",
 ];
 
@@ -44,18 +45,27 @@ pub struct ScriptDetector {
     name: String,
     severity: Severity,
     description: String,
-    source: String,
     path: String,
+    /// One runtime+context per rule, with the script evaluated once at load
+    /// time and reused across modules (a fresh QuickJS runtime + re-eval per
+    /// file made large scans QuickJS-bound, not parser-bound). Visitor
+    /// functions are stateless by contract; the per-module `report` sink is
+    /// swapped in before each run.
+    _runtime: Runtime,
+    context: Context,
+    /// Interrupt-check counter, reset per module.
+    interrupt_count: Rc<std::cell::Cell<u64>>,
 }
 
-fn new_runtime() -> Result<Runtime, String> {
+fn new_runtime() -> Result<(Runtime, Rc<std::cell::Cell<u64>>), String> {
     let rt = Runtime::new().map_err(|e| e.to_string())?;
-    let count = std::cell::Cell::new(0u64);
+    let count = Rc::new(std::cell::Cell::new(0u64));
+    let handler_count = count.clone();
     rt.set_interrupt_handler(Some(Box::new(move || {
-        count.set(count.get() + 1);
-        count.get() > MAX_INTERRUPT_CHECKS
+        handler_count.set(handler_count.get() + 1);
+        handler_count.get() > MAX_INTERRUPT_CHECKS
     })));
-    Ok(rt)
+    Ok((rt, count))
 }
 
 /// Read a top-level string constant. `const` bindings are lexical, not
@@ -88,9 +98,9 @@ pub fn load_script(path: &Path) -> Result<Box<dyn Detector>, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read rules script {}: {}", path.display(), e))?;
 
-    let rt = new_runtime()?;
+    let (rt, interrupt_count) = new_runtime()?;
     let context = Context::full(&rt).map_err(|e| e.to_string())?;
-    context.with(|ctx| {
+    let loaded = context.with(|ctx| {
         // report() must exist at load time so top-level code referencing it parses.
         register_report(&ctx, Rc::new(RefCell::new(Vec::new())))?;
         ctx.eval::<(), _>(source.as_bytes())
@@ -123,14 +133,19 @@ pub fn load_script(path: &Path) -> Result<Box<dyn Detector>, String> {
             ));
         }
 
-        Ok(Box::new(ScriptDetector {
-            name,
-            severity,
-            description,
-            source,
-            path: path.display().to_string(),
-        }) as Box<dyn Detector>)
-    })
+        Ok((name, severity, description))
+    });
+    let (name, severity, description) = loaded?;
+    let _ = source;
+    Ok(Box::new(ScriptDetector {
+        name,
+        severity,
+        description,
+        path: path.display().to_string(),
+        _runtime: rt,
+        context,
+        interrupt_count,
+    }) as Box<dyn Detector>)
 }
 
 /// (line, column, message) reported by the script.
@@ -171,13 +186,10 @@ impl ScriptDetector {
     fn run(&self, module: &DamlModule) -> Result<Vec<Finding>, String> {
         let reported: Reported = Rc::new(RefCell::new(Vec::new()));
 
-        let rt = new_runtime()?;
-        let context = Context::full(&rt).map_err(|e| e.to_string())?;
-        context.with(|ctx| -> Result<(), String> {
+        self.interrupt_count.set(0);
+        self.context.with(|ctx| -> Result<(), String> {
+            // Fresh sink per module; replaces the previous report binding.
             register_report(&ctx, reported.clone())?;
-            ctx.eval::<(), _>(self.source.as_bytes())
-                .catch(&ctx)
-                .map_err(|e| format!("rule '{}': {}", self.name, e))?;
 
             let globals = ctx.globals();
             let visitor = |name: &str| globals.get::<_, Function>(name).ok();
@@ -208,6 +220,12 @@ impl ScriptDetector {
                 for function in &module.functions {
                     let fun = parse_node(&ctx, rule, json(function))?;
                     invoke(&ctx, rule, &f, "on_function", (fun,))?;
+                }
+            }
+            if let Some(f) = visitor("on_interface") {
+                for interface in &module.interfaces {
+                    let i = parse_node(&ctx, rule, json(interface))?;
+                    invoke(&ctx, rule, &f, "on_interface", (i,))?;
                 }
             }
             if let Some(f) = visitor("on_import") {
@@ -443,15 +461,30 @@ function on_template(t) {}
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_runtime_error_surfaces_rule_and_visitor() {
-        let script = ScriptDetector {
-            name: "boom".to_string(),
+    fn raw_detector(name: &str, source: &str) -> ScriptDetector {
+        let (runtime, interrupt_count) = new_runtime().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            register_report(&ctx, Rc::new(RefCell::new(Vec::new()))).unwrap();
+            ctx.eval::<(), _>(source.as_bytes()).unwrap();
+        });
+        ScriptDetector {
+            name: name.to_string(),
             severity: Severity::Low,
             description: String::new(),
-            source: r#"function on_template(t) { t.does.not.exist; }"#.to_string(),
-            path: "test.js".to_string(),
-        };
+            path: format!("{}.js", name),
+            _runtime: runtime,
+            context,
+            interrupt_count,
+        }
+    }
+
+    #[test]
+    fn test_runtime_error_surfaces_rule_and_visitor() {
+        let script = raw_detector(
+            "boom",
+            r#"function on_template(t) { t.does.not.exist; }"#,
+        );
         let module = parse_daml(TEMPLATE_NO_ENSURE, Path::new("Test.daml"));
         let err = script.run(&module).unwrap_err();
         assert!(err.contains("boom"));
@@ -460,20 +493,34 @@ function on_template(t) {}
 
     #[test]
     fn test_infinite_loop_interrupted() {
-        let script = ScriptDetector {
-            name: "spin".to_string(),
-            severity: Severity::Low,
-            description: String::new(),
-            source: r#"
+        let script = raw_detector(
+            "spin",
+            r#"
 const NAME = "spin";
 const SEVERITY = "low";
 function on_template(t) { while (true) {} }
-"#
-            .to_string(),
-            path: "spin.js".to_string(),
-        };
+"#,
+        );
         let module = parse_daml(TEMPLATE_NO_ENSURE, Path::new("Test.daml"));
         assert!(script.run(&module).is_err());
+    }
+
+    /// Interrupt counter resets between modules: a long (but finite) rule
+    /// run on many modules must not trip the runaway-loop guard.
+    #[test]
+    fn test_interrupt_counter_resets_per_module() {
+        let script = raw_detector(
+            "busy",
+            r#"
+const NAME = "busy";
+const SEVERITY = "low";
+function on_template(t) { let x = 0; for (let i = 0; i < 200000; i++) { x += i; } }
+"#,
+        );
+        let module = parse_daml(TEMPLATE_NO_ENSURE, Path::new("Test.daml"));
+        for _ in 0..5 {
+            assert!(script.run(&module).is_ok());
+        }
     }
 
     /// Exercises every script-visible node kind: all scalar and parameterized
@@ -523,11 +570,40 @@ template Probe
         pure cid
 
     nonconsuming choice Noop : ()
+      observer owner
       controller owner
       do
         pure ()
 
+    key (owner, note) : (Party, Text)
+    maintainer key._1
+
+    interface instance Probeable for Probe where
+      view = ProbeView owner
+
+interface Probeable where
+  viewtype ProbeView
+  getProbeOwner : Party
+
+  nonconsuming choice GetProbeView : ProbeView
+    with
+      viewer : Party
+    controller viewer
+    do
+      pure (view this)
+
+helper : Int -> Int
 helper x = x + 1
+
+describe owner xs total parts = do
+  let scaled = map (\y -> y * 2) xs
+  let pair = (total / parts, [total, parts])
+  let label = if total > 0.0 then "pos" else show (-total)
+  let picked = case xs of
+        [] -> None
+        h :: _ -> Some h
+  let result = let inner = Map.Map in inner
+  pure (FooCon with field1 = label)
 "#;
         let det = load_script_from_str(
             "census",
@@ -535,21 +611,65 @@ helper x = x + 1
 const NAME = "node-census";
 const SEVERITY = "info";
 
+function exprKinds(e, seen) {
+  if (e === null || typeof e !== "object") return;
+  const k = Object.keys(e)[0];
+  seen.add("Expr:" + k);
+  const p = e[k];
+  for (const key of Object.keys(p)) {
+    const v = p[key];
+    if (key === "span") continue;
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        if (item && typeof item === "object") {
+          if ("body" in item && "pattern" in item) exprKinds(item.body, seen);
+          else if ("value" in item && "name" in item) {
+            if (item.value !== null) exprKinds(item.value, seen);
+          } else if (Object.keys(item).length === 1) {
+            if (k === "DoBlock") stmtKinds([item], seen);
+            else exprKinds(item, seen);
+          }
+        }
+      }
+    } else if (v && typeof v === "object") {
+      exprKinds(v, seen);
+    }
+  }
+}
+
 function stmtKinds(stmts, seen) {
   for (const s of stmts) {
     const k = Object.keys(s)[0];
     seen.add(k);
+    const p = s[k];
+    if (p.binder !== undefined && p.binder !== null) seen.add("Binder");
     if (k === "TryCatch") {
-      stmtKinds(s.TryCatch.try_body, seen);
-      stmtKinds(s.TryCatch.catch_body, seen);
+      stmtKinds(p.try_body, seen);
+      stmtKinds(p.catch_body, seen);
     }
+    if (p.value) exprKinds(p.value, seen);
+    if (p.condition_expr) exprKinds(p.condition_expr, seen);
+    if (p.cid) exprKinds(p.cid, seen);
+    if (p.argument) exprKinds(p.argument, seen);
+    if (p.expr && typeof p.expr === "object") exprKinds(p.expr, seen);
   }
 }
 
 function check(m) {
   const seen = new Set();
   for (const t of m.templates) {
-    if (t.ensure_clause !== null) seen.add("Ensure");
+    if (t.ensure_clause !== null) {
+      seen.add("Ensure");
+      exprKinds(t.ensure_clause.expr, seen);
+    }
+    if (t.key_expr !== null) seen.add("KeyExpr");
+    if (t.key_type !== null) seen.add("KeyType");
+    if (t.maintainer_exprs.length > 0) seen.add("Maintainer");
+    if (t.signatory_exprs.length > 0) seen.add("SignatoryExpr");
+    if (t.interface_instances.length > 0) {
+      seen.add("InterfaceInstance");
+      if (t.interface_instances[0].methods.length > 0) seen.add("InstanceMethod");
+    }
     for (const f of t.fields) {
       if (typeof f.type_ === "string") seen.add("Scalar:" + f.type_);
       else seen.add("Param:" + Object.keys(f.type_)[0]);
@@ -557,13 +677,25 @@ function check(m) {
     for (const c of t.choices) {
       if (c.parameters.length > 0) seen.add("ChoiceParams");
       if (!c.consuming) seen.add("Nonconsuming");
+      if (c.controller_exprs.length > 0) seen.add("ControllerExpr");
+      if (c.observer_exprs.length > 0) seen.add("ChoiceObserver");
       stmtKinds(c.body, seen);
     }
+  }
+  for (const i of m.interfaces) {
+    seen.add("Interface");
+    if (i.viewtype !== null) seen.add("Viewtype");
+    if (i.methods.length > 0) seen.add("InterfaceMethod");
+    if (i.choices.length > 0) seen.add("InterfaceChoice");
   }
   for (const i of m.imports) {
     if (i.qualified && i.alias !== null) seen.add("QualifiedAlias");
   }
-  if (m.functions.length > 0) seen.add("Function");
+  for (const fn of m.functions) {
+    seen.add("Function");
+    if (fn.type_signature !== null) seen.add("TypeSignature");
+    stmtKinds(fn.body, seen);
+  }
   for (const k of Array.from(seen).sort()) report(1, k);
 }
 "#,
@@ -597,6 +729,34 @@ function check(m) {
             "TryCatch",
             "QualifiedAlias",
             "Function",
+            // v2 structured surface
+            "Binder",
+            "KeyExpr",
+            "KeyType",
+            "Maintainer",
+            "SignatoryExpr",
+            "ControllerExpr",
+            "ChoiceObserver",
+            "InterfaceInstance",
+            "InstanceMethod",
+            "Interface",
+            "Viewtype",
+            "InterfaceMethod",
+            "InterfaceChoice",
+            "TypeSignature",
+            "Expr:Var",
+            "Expr:Con",
+            "Expr:Lit",
+            "Expr:App",
+            "Expr:BinOp",
+            "Expr:Neg",
+            "Expr:Lambda",
+            "Expr:If",
+            "Expr:Case",
+            "Expr:LetIn",
+            "Expr:Record",
+            "Expr:Tuple",
+            "Expr:List",
         ] {
             assert!(
                 seen.iter().any(|m| m == expected),

@@ -81,7 +81,7 @@ impl UnguardedDivision {
         // Check if any assert or ensure references the denominator with a > 0 check
         for stmt in statements {
             match stmt {
-                Statement::Assert { condition } => {
+                Statement::Assert { condition, .. } => {
                     if condition.contains(denominator)
                         && (condition.contains("> 0")
                             || condition.contains(">= 0")

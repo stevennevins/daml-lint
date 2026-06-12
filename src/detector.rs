@@ -45,7 +45,8 @@ pub fn parse_severity(s: &str) -> Option<Severity> {
     }
 }
 
-pub trait Detector: Send + Sync {
+// Scanning is single-threaded; detectors hold per-rule QuickJS state.
+pub trait Detector {
     fn name(&self) -> &str;
     fn severity(&self) -> Severity;
     fn description(&self) -> &str;

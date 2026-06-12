@@ -513,6 +513,7 @@ impl Parser {
             }
             Some("key") => {
                 self.bump();
+                let expr_start = self.i;
                 let expr = self.expr();
                 let mut type_text = String::new();
                 if self.eat_op(":") {
@@ -520,6 +521,21 @@ impl Parser {
                     self.skip_to_item_end();
                     type_text = self.slice_text(ty_start);
                 } else {
+                    // The expression parser consumes `: Type` annotations;
+                    // recover the key type from the last top-level colon.
+                    let mut depth = 0i32;
+                    let mut colon = None;
+                    for j in expr_start..self.i {
+                        match &self.toks[j].tok {
+                            Tok::LParen | Tok::LBracket => depth += 1,
+                            Tok::RParen | Tok::RBracket => depth -= 1,
+                            Tok::Op(o) if o == ":" && depth == 0 => colon = Some(j),
+                            _ => {}
+                        }
+                    }
+                    if let Some(j) = colon {
+                        type_text = render_tokens(&self.toks[j + 1..self.i]);
+                    }
                     self.skip_to_item_end();
                 }
                 TemplateBodyDecl::Key {
