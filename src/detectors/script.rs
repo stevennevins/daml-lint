@@ -614,5 +614,10 @@ function check(m) {
             load_script(Path::new("examples/consuming-choice-signatory-controller.js")).is_ok()
         );
         assert!(load_script(Path::new("examples/no-trace.js")).is_ok());
+        assert!(load_script(Path::new("examples/no-create-in-nonconsuming.js")).is_ok());
+        assert!(load_script(Path::new("examples/no-bare-contractid-field.js")).is_ok());
+        assert!(load_script(Path::new("examples/unqualified-da-import.js")).is_ok());
+        assert!(load_script(Path::new("examples/function-ledger-actions.js")).is_ok());
+        assert!(load_script(Path::new("examples/choice-param-shadows-field.js")).is_ok());
     }
 }
