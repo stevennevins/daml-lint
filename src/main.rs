@@ -1,4 +1,5 @@
 mod detector;
+mod adversarial_tests;
 mod ast;
 mod corpus_tests;
 mod lexer;

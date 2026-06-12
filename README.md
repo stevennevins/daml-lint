@@ -7,6 +7,12 @@
 
 Static analysis scanner for [DAML](https://www.digitalasset.com/developers) smart contracts. Catches security vulnerabilities and anti-patterns through AST pattern matching, similar to what [Slither](https://github.com/crytic/slither) does for Solidity.
 
+Parsing is a pure-Rust pipeline — lexer (comments, strings, layout-aware
+spans) → Haskell offside-rule layout resolution → recursive-descent parser
+producing a typed AST with positions on every node. Files that fail to parse
+degrade to partial structure with a diagnostic on stderr (`file:line:col`);
+a scan never aborts on bad input.
+
 ## Detectors
 
 | Detector | Severity | Description |
@@ -95,12 +101,13 @@ Visitors (define any subset, at least one):
 
 | Function | Called for | Node fields |
 |---|---|---|
-| `on_template(template)` | each template | `name`, `fields`, `signatories`, `observers`, `ensure_clause` (`null` if absent), `choices`, `span` |
-| `on_choice(choice, template)` | each choice | `name`, `consuming`, `controllers`, `parameters`, `return_type`, `body`, `body_raw`, `span` |
+| `on_template(template)` | each template | `name`, `fields`, `signatories`/`signatory_exprs`, `observers`/`observer_exprs`, `ensure_clause` (`null` if absent), `key_expr`, `key_type`, `maintainer_exprs`, `choices`, `interface_instances`, `span` |
+| `on_choice(choice, template)` | each choice | `name`, `consuming`, `controllers`/`controller_exprs`, `observer_exprs`, `parameters`, `return_type`, `body`, `body_raw`, `span` |
 | `on_field(field, template)` | each template field | `name`, `type_`, `span` |
-| `on_function(function)` | each top-level function | `name`, `body`, `body_raw`, `span` |
+| `on_function(function)` | each top-level function | `name`, `type_signature`, `body`, `body_raw`, `span` |
 | `on_import(import)` | each import | `module_name`, `qualified`, `alias` |
-| `check(m)` | once per module | `name`, `file`, `imports`, `templates`, `functions`, `source` |
+| `on_interface(interface)` | each interface | `name`, `requires`, `viewtype`, `methods`, `choices`, `span` |
+| `check(m)` | once per module | `name`, `file`, `imports`, `templates`, `interfaces`, `functions`, `source` |
 
 Report findings with `report(node, message)` (location taken from the node's
 `span`) or `report(line, message)`. The rule's `SEVERITY` applies to all its
@@ -109,11 +116,24 @@ findings. Node shapes are declared in
 [src/ir.rs](src/ir.rs); statement nodes in `body` are objects keyed by kind,
 e.g. `"Create" in stmt`.
 
+Statements carry a typed expression AST: `stmt.Let.value`,
+`stmt.Assert.condition_expr`, `stmt.Exercise.cid`/`.argument`, and
+`stmt.Other.expr` are `Expr` nodes — tagged unions like
+`{ BinOp: { op: "/", lhs, rhs, span } }` with a 1-based `span` on every
+node (see the `Expr` type in the .d.ts). The v1 raw-text fields
+(`body_raw`, `raw_text`, statement `expr`/`condition`/`raw`) still work
+but are deprecated; new rules should match on structure, not substrings.
+[examples/unguarded-division-ast.ts](examples/unguarded-division-ast.ts)
+shows a denominator-guard check written entirely on typed nodes.
+
 Heads up: visitors must be `function` declarations — arrow functions assigned
 to `const` are not discovered. If a script fails at runtime the scan aborts
 with exit code 2; rule errors are never swallowed. A runaway loop is
 interrupted so a broken rule can't hang CI. The engine runs JavaScript
 (ES2023) — no Node APIs, no `require`/`import`, no filesystem or network.
+Each rule's script is evaluated once and its visitors are then called for
+every module — visitors should be stateless; don't accumulate findings in
+top-level mutable state across files.
 
 `SEVERITY` is one of `critical`, `high`, `medium`, `low`, `info`. Custom rules
 run alongside the built-in detectors, appear in all output formats, and count
@@ -126,6 +146,7 @@ Examples:
 - [examples/consuming-choice-signatory-controller.ts](examples/consuming-choice-signatory-controller.ts) — cross-references choice controllers against template signatories
 - [examples/no-create-in-nonconsuming.ts](examples/no-create-in-nonconsuming.ts) — walks choice body statements, recursing into try/catch
 - [examples/no-trace.ts](examples/no-trace.ts) — banned-token check over raw source lines
+- [examples/unguarded-division-ast.ts](examples/unguarded-division-ast.ts) — expression-level analysis on the typed AST (division denominators vs prior assertions)
 
 Each example ships with its compiled `.js` next to it — that's the file
 `--rules` takes.

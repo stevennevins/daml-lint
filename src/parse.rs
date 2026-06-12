@@ -14,6 +14,7 @@ pub fn parse_module(source: &str) -> (Module, Vec<ParseDiagnostic>) {
     let mut p = Parser {
         toks: tokens,
         i: 0,
+        depth: 0,
         diags: lex_errors
             .into_iter()
             .map(|e| ParseDiagnostic {
@@ -30,7 +31,12 @@ struct Parser {
     toks: Vec<Token>,
     i: usize,
     diags: Vec<ParseDiagnostic>,
+    /// Expression/pattern recursion depth; bounded so hostile inputs
+    /// (thousands of nested parens) cannot overflow the stack.
+    depth: u32,
 }
+
+const MAX_DEPTH: u32 = 128;
 
 impl Parser {
     // ----- cursor primitives -------------------------------------------
@@ -1008,6 +1014,16 @@ impl Parser {
     // ----- patterns ------------------------------------------------------
 
     fn pattern_atom(&mut self) -> Option<Pat> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let result = self.pattern_atom_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn pattern_atom_inner(&mut self) -> Option<Pat> {
         let pos = self.pos();
         match self.peek().cloned() {
             Some(Tok::LowerId {
@@ -1137,6 +1153,16 @@ impl Parser {
 
     /// Full pattern: constructor applications and infix cons `x :: xs`.
     fn pattern(&mut self) -> Option<Pat> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let result = self.pattern_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn pattern_inner(&mut self) -> Option<Pat> {
         let pos = self.pos();
         let first = match self.peek().cloned() {
             Some(Tok::UpperId { qualifier, name }) => {
@@ -1242,6 +1268,25 @@ impl Parser {
 
     fn expr_prec(&mut self, min_prec: u8, allow_do: bool) -> Expr {
         let pos = self.pos();
+        if self.depth >= MAX_DEPTH {
+            // Hostile nesting: degrade to raw text instead of recursing.
+            let start = self.i;
+            self.skip_to_item_end();
+            if self.i == start {
+                self.bump();
+            }
+            return Expr::Error {
+                raw: self.slice_text(start),
+                pos,
+            };
+        }
+        self.depth += 1;
+        let result = self.expr_prec_inner(min_prec, allow_do, pos);
+        self.depth -= 1;
+        result
+    }
+
+    fn expr_prec_inner(&mut self, min_prec: u8, allow_do: bool, pos: Pos) -> Expr {
         let mut lhs = match self.unary(allow_do) {
             Some(e) => e,
             None => {
