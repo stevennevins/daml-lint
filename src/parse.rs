@@ -683,6 +683,15 @@ impl Parser {
             return None;
         }
         let name = self.upper_name()?;
+        let mut requires = Vec::new();
+        if self.eat_keyword("requires") {
+            while let Some(r) = self.upper_name() {
+                requires.push(r);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
         if !self.eat_keyword("where") {
             return None;
         }
@@ -692,6 +701,7 @@ impl Parser {
         if !(self.eat(&Tok::VLBrace) || self.eat(&Tok::LBrace)) {
             return Some(InterfaceDecl {
                 name,
+                requires,
                 viewtype,
                 methods,
                 choices,
@@ -750,6 +760,7 @@ impl Parser {
         }
         Some(InterfaceDecl {
             name,
+            requires,
             viewtype,
             methods,
             choices,

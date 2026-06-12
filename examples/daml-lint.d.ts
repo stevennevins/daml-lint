@@ -207,6 +207,8 @@ interface InterfaceMethod {
 /** A DAML interface declaration. Visited via on_interface. */
 interface DamlInterface {
   name: string;
+  /** Interfaces this interface requires (`requires Lockable.I`). */
+  requires: string[];
   viewtype: string | null;
   methods: InterfaceMethod[];
   choices: Choice[];

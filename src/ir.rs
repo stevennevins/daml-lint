@@ -387,6 +387,8 @@ pub struct InterfaceMethod {
 #[derive(Debug, Clone, Serialize)]
 pub struct Interface {
     pub name: String,
+    /// Interfaces this interface requires.
+    pub requires: Vec<String>,
     pub viewtype: Option<String>,
     pub methods: Vec<InterfaceMethod>,
     pub choices: Vec<Choice>,

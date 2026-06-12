@@ -163,6 +163,8 @@ pub struct TemplateDecl {
 #[derive(Debug, Clone)]
 pub struct InterfaceDecl {
     pub name: String,
+    /// Interfaces this interface requires (`requires Lockable.I, ...`).
+    pub requires: Vec<String>,
     pub viewtype: Option<String>,
     /// Method signatures: name and type text.
     pub methods: Vec<FieldDecl>,
@@ -272,7 +274,12 @@ impl Expr {
                 s
             }
             Expr::BinOp { op, lhs, rhs, .. } => {
-                format!("{} {} {}", lhs.render_atomic(), op, rhs.render_atomic())
+                if op == "." {
+                    // Record projection / composition: `account.custodian`.
+                    format!("{}.{}", lhs.render_atomic(), rhs.render_atomic())
+                } else {
+                    format!("{} {} {}", lhs.render_atomic(), op, rhs.render_atomic())
+                }
             }
             Expr::Neg { expr, .. } => format!("-{}", expr.render_atomic()),
             Expr::Lambda { params, body, .. } => {

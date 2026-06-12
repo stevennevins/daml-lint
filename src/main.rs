@@ -1,5 +1,6 @@
 mod detector;
 mod ast;
+mod corpus_tests;
 mod lexer;
 mod parse;
 mod layout;

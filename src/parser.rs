@@ -297,6 +297,7 @@ fn lower_template(t: &ast::TemplateDecl, file: &Path, lines: &[&str]) -> Templat
 fn lower_interface(i: &ast::InterfaceDecl, file: &Path, lines: &[&str]) -> Interface {
     Interface {
         name: i.name.clone(),
+        requires: i.requires.clone(),
         viewtype: i.viewtype.clone(),
         methods: i
             .methods
