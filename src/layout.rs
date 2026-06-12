@@ -8,9 +8,13 @@
 use crate::lexer::{Pos, Tok, Token};
 
 /// Keywords that open a layout block. DAML adds `with` (template fields,
-/// choice parameters, record construction) to Haskell's set.
+/// choice parameters, record construction) and `catch` (exception handler
+/// alternatives) to Haskell's set.
 fn is_layout_keyword(tok: &Tok) -> bool {
-    matches!(tok.keyword(), Some("where" | "do" | "of" | "let" | "with"))
+    matches!(
+        tok.keyword(),
+        Some("where" | "do" | "of" | "let" | "with" | "catch")
+    )
 }
 
 #[derive(Debug)]
@@ -39,6 +43,7 @@ pub fn resolve_layout(tokens: Vec<Token>) -> Vec<Token> {
             Some("of") => "of",
             Some("let") => "let",
             Some("with") => "with",
+            Some("catch") => "catch",
             _ => "",
         }
     };
@@ -96,9 +101,13 @@ pub fn resolve_layout(tokens: Vec<Token>) -> Vec<Token> {
         }
 
         // Offside check at the first token of each new line.
+        let mut offside_closed_let = false;
         if pos.line != last_line {
             while let Some(top) = stack.last() {
                 if top.col > 0 && col < top.col {
+                    if top.opened_by == "let" {
+                        offside_closed_let = true;
+                    }
                     close(&mut out, pos);
                     stack.pop();
                 } else {
@@ -130,8 +139,10 @@ pub fn resolve_layout(tokens: Vec<Token>) -> Vec<Token> {
         }
 
         // `in` closes the matching `let` block when still open (same-line
-        // `let x = 1 in x`).
-        if token.tok.is_keyword("in") {
+        // `let x = 1 in x`). If the offside check above already closed the
+        // matching let, the top context belongs to something enclosing —
+        // leave it alone.
+        if token.tok.is_keyword("in") && !offside_closed_let {
             if let Some(top) = stack.last() {
                 if top.col > 0 && top.opened_by == "let" {
                     close(&mut out, pos);

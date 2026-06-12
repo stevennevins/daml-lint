@@ -1,666 +1,476 @@
+//! Lowering: typed AST (src/ast.rs, built by src/parse.rs) → rule-facing IR
+//! (src/ir.rs).
+//!
+//! This replaces the old line-based keyword shim. The IR shapes are the
+//! stable contract with rule scripts; raw-text fields (`body_raw`,
+//! `raw_text`, statement `raw`) are reconstructed from real parse trees so
+//! existing rules keep working.
+
+use crate::ast::{self, Consuming, Decl, DoStmt, Expr, TemplateBodyDecl};
 use crate::ir::*;
+use crate::parse::parse_module;
 use std::path::Path;
 
-/// Parse a DAML source file into a DamlModule IR.
-///
-/// Line-based DAML keyword shim extracting templates, choices, fields, and
-/// ensure clauses by matching indentation-based patterns in the source text.
-/// (A previous tree-sitter-haskell "validation" pass was removed: its result
-/// was discarded, and parsing certain files corrupted the heap — SIGABRT on
-/// multi-file scans.)
+/// Parse a DAML source file into a DamlModule IR. Never panics; parse
+/// problems degrade to partial structure.
 pub fn parse_daml(source: &str, file: &Path) -> DamlModule {
-    let lines: Vec<&str> = source.lines().collect();
-    let module_name = extract_module_name(&lines);
-    let imports = extract_imports(&lines, file);
-    let templates = extract_templates(&lines, file);
-    let functions = extract_functions(&lines, file, &templates);
+    parse_daml_with_diagnostics(source, file).0
+}
 
-    DamlModule {
-        name: module_name,
+/// (line, column, message) diagnostics for the caller to report.
+pub type Diagnostic = (usize, usize, String);
+
+pub fn parse_daml_with_diagnostics(source: &str, file: &Path) -> (DamlModule, Vec<Diagnostic>) {
+    let (module, diags) = parse_module(source);
+    let lines: Vec<&str> = source.lines().collect();
+
+    let span = |pos: ast::Pos| Span {
+        file: file.to_path_buf(),
+        line: pos.line,
+        column: pos.column,
+    };
+
+    let imports = module
+        .imports
+        .iter()
+        .map(|i| Import {
+            module_name: i.module_name.clone(),
+            qualified: i.qualified,
+            alias: i.alias.clone(),
+            span: span(i.pos),
+        })
+        .collect();
+
+    let mut templates = Vec::new();
+    let mut functions = Vec::new();
+
+    for decl in &module.decls {
+        match decl {
+            Decl::Template(t) => templates.push(lower_template(t, file, &lines)),
+            Decl::Function(f) => {
+                if f.equations.is_empty() {
+                    continue; // type signature without a body
+                }
+                functions.push(lower_function(f, file, &lines));
+            }
+            _ => {}
+        }
+    }
+
+    let ir = DamlModule {
+        name: module.name,
         file: file.to_path_buf(),
         source: source.to_string(),
         imports,
         templates,
         functions,
-    }
+    };
+    let diags = diags
+        .into_iter()
+        .map(|d| (d.pos.line, d.pos.column, d.message))
+        .collect();
+    (ir, diags)
 }
 
-fn extract_module_name(lines: &[&str]) -> String {
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.starts_with("module ") {
-            if let Some(name) = trimmed
-                .strip_prefix("module ")
-                .and_then(|s| s.split_whitespace().next())
-            {
-                return name.to_string();
+fn lower_template(t: &ast::TemplateDecl, file: &Path, lines: &[&str]) -> Template {
+    let span = |pos: ast::Pos| Span {
+        file: file.to_path_buf(),
+        line: pos.line,
+        column: pos.column,
+    };
+
+    let fields = t
+        .fields
+        .iter()
+        .map(|f| Field {
+            name: f.name.clone(),
+            type_: DamlType::from_str(&f.type_text),
+            span: span(f.pos),
+        })
+        .collect();
+
+    let mut signatories = Vec::new();
+    let mut observers = Vec::new();
+    let mut ensure_clause = None;
+    let mut choices = Vec::new();
+
+    for item in &t.body {
+        match item {
+            TemplateBodyDecl::Signatory { parties, .. } => {
+                signatories.extend(party_names(parties));
             }
+            TemplateBodyDecl::Observer { parties, .. } => {
+                observers.extend(party_names(parties));
+            }
+            TemplateBodyDecl::Ensure { expr, pos } => {
+                ensure_clause = Some(EnsureClause {
+                    raw_text: format!("ensure {}", expr.render()),
+                    span: span(*pos),
+                });
+            }
+            TemplateBodyDecl::Choice(c) => choices.push(lower_choice(c, file, lines)),
+            _ => {}
         }
     }
-    "Unknown".to_string()
+
+    Template {
+        name: t.name.clone(),
+        fields,
+        signatories,
+        observers,
+        ensure_clause,
+        choices,
+        span: span(t.pos),
+    }
 }
 
-fn extract_imports(lines: &[&str], file: &Path) -> Vec<Import> {
-    let mut imports = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("import ") {
-            let qualified = trimmed.contains("qualified");
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            let module_name = parts
-                .iter()
-                .find(|p| {
-                    p.starts_with(|c: char| c.is_uppercase()) && **p != "qualified"
-                })
-                .unwrap_or(&"Unknown")
-                // `import DA.Map(fromList)` — the import list can abut the name
-                .split('(')
-                .next()
-                .unwrap_or("Unknown")
-                .to_string();
-            let alias = parts
-                .iter()
-                .position(|p| *p == "as")
-                .and_then(|i| parts.get(i + 1))
-                .map(|s| s.to_string());
-            imports.push(Import {
-                module_name,
-                qualified,
-                alias,
-                span: Span {
-                    file: file.to_path_buf(),
-                    line: idx + 1,
-                    column: 1,
-                },
-            });
+/// Flatten party expressions into comparable strings: a list literal
+/// contributes one entry per element (`signatory [a, b]` → "a", "b").
+fn party_names(exprs: &[Expr]) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in exprs {
+        match e {
+            Expr::List { items, .. } => out.extend(items.iter().map(|i| i.render())),
+            other => out.push(other.render()),
         }
     }
-    imports
+    out
 }
 
-/// True if `kw` appears as a standalone keyword — not as part of a longer
-/// identifier or a qualified call (`Lifecycle.exercise` is a function named
-/// exercise, not the ledger action).
-fn has_keyword(line: &str, kw: &str) -> bool {
-    let mut start = 0;
-    while let Some(idx) = line[start..].find(kw) {
-        let abs = start + idx;
-        let preceded_by_ident = line[..abs]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c == '.' || c.is_alphanumeric() || c == '_');
-        if !preceded_by_ident {
-            return true;
-        }
-        start = abs + kw.len();
-    }
-    false
-}
-
-/// Strip a trailing `--` line comment; full-comment lines become empty.
-fn strip_comment(trimmed: &str) -> &str {
-    if trimmed.starts_with("--") {
-        return "";
-    }
-    match trimmed.find(" --") {
-        Some(idx) => trimmed[..idx].trim_end(),
-        None => trimmed,
-    }
-}
-
-fn indent_level(line: &str) -> usize {
-    line.len() - line.trim_start().len()
-}
-
-fn extract_templates(lines: &[&str], file: &Path) -> Vec<Template> {
-    let mut templates = Vec::new();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
-        if trimmed.starts_with("template ")
-            && !trimmed.starts_with("template instance")
-        {
-            let template_indent = indent_level(lines[i]);
-            let name = trimmed
-                .strip_prefix("template ")
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap_or("Unknown")
-                .to_string();
-            let span = Span {
+fn lower_choice(c: &ast::ChoiceDecl, file: &Path, lines: &[&str]) -> Choice {
+    let parameters = c
+        .params
+        .iter()
+        .map(|f| Field {
+            name: f.name.clone(),
+            type_: DamlType::from_str(&f.type_text),
+            span: Span {
                 file: file.to_path_buf(),
-                line: i + 1,
-                column: template_indent + 1,
-            };
+                line: f.pos.line,
+                column: f.pos.column,
+            },
+        })
+        .collect();
 
-            // Find the template body (everything indented more than template line)
-            let body_start = i + 1;
-            let mut body_end = body_start;
-            while body_end < lines.len() {
-                if lines[body_end].trim().is_empty() {
-                    body_end += 1;
-                    continue;
-                }
-                if indent_level(lines[body_end]) <= template_indent
-                    && !lines[body_end].trim().is_empty()
-                {
-                    break;
-                }
-                body_end += 1;
-            }
+    // body_raw is the original source slice (line-faithful: built-in
+    // detectors scan it by line offset from the choice span).
+    let first = c.pos.line; // 1-based header line
+    let last = c.end_line.min(lines.len());
+    let body_raw = if first < last {
+        lines[first..last].join("\n")
+    } else {
+        String::new()
+    };
 
-            let template_body = &lines[body_start..body_end];
-            let fields = extract_fields(template_body, body_start, file);
-            let signatories = extract_clause(template_body, "signatory");
-            let observers = extract_clause(template_body, "observer");
-            let ensure_clause = extract_ensure(template_body, body_start, file);
-            let choices = extract_choices(template_body, body_start, file);
+    let body = match &c.body {
+        Some(expr) => statements_of_expr(expr),
+        None => Vec::new(),
+    };
 
-            templates.push(Template {
-                name,
-                fields,
-                signatories,
-                observers,
-                ensure_clause,
-                choices,
-                span,
-            });
-
-            i = body_end;
+    Choice {
+        name: c.name.clone(),
+        consuming: c.consuming == Consuming::Consuming,
+        controllers: party_names(&c.controllers),
+        parameters,
+        return_type: if c.return_type_text.is_empty() {
+            DamlType::Unknown
         } else {
-            i += 1;
+            DamlType::from_str(&c.return_type_text)
+        },
+        body,
+        body_raw,
+        span: Span {
+            file: file.to_path_buf(),
+            line: c.pos.line,
+            column: c.pos.column,
+        },
+    }
+}
+
+fn lower_function(f: &ast::FunctionDecl, file: &Path, lines: &[&str]) -> Function {
+    let first = f.pos.line.saturating_sub(1);
+    let last = f.end_line.min(lines.len());
+    let body_raw = if first < last {
+        lines[first..last].join("\n")
+    } else {
+        String::new()
+    };
+
+    let mut body = Vec::new();
+    for eq in &f.equations {
+        if eq.guards.is_empty() {
+            body.extend(statements_of_expr(&eq.body));
+        } else {
+            for (_, guard_body) in &eq.guards {
+                body.extend(statements_of_expr(guard_body));
+            }
+        }
+        // `where` helpers can perform ledger actions when invoked; surface
+        // their actions like the line shim did.
+        for b in &eq.where_bindings {
+            let mut acts = Vec::new();
+            collect_actions(&b.expr, &mut acts);
+            body.extend(acts);
         }
     }
 
-    templates
+    Function {
+        name: f.name.clone(),
+        body,
+        body_raw,
+        span: Span {
+            file: file.to_path_buf(),
+            line: f.pos.line,
+            column: f.pos.column,
+        },
+    }
 }
 
-fn extract_fields(body: &[&str], body_offset: usize, file: &Path) -> Vec<Field> {
-    let mut fields = Vec::new();
-    let mut in_with_block = false;
-    let mut found_first_with = false;
-
-    for (idx, line) in body.iter().enumerate() {
-        let trimmed = line.trim();
-
-        // Only match the first `with` block (template fields), not choice `with` blocks
-        if !found_first_with && (trimmed == "with" || trimmed.starts_with("with") && trimmed.len() == 4) {
-            in_with_block = true;
-            found_first_with = true;
-            continue;
+/// Statements of a choice/function body expression: a do block yields its
+/// statements; any other expression is a single statement.
+fn statements_of_expr(expr: &Expr) -> Vec<Statement> {
+    match expr {
+        Expr::Do { stmts, .. } => lower_do(stmts),
+        other => {
+            let mut acts = Vec::new();
+            if collect_actions(other, &mut acts) {
+                acts
+            } else {
+                vec![Statement::Other {
+                    raw: other.render(),
+                }]
+            }
         }
+    }
+}
 
-        // End of with block when we hit where, signatory, ensure, choice, etc.
-        if in_with_block
-            && (trimmed.starts_with("where")
-                || trimmed.starts_with("signatory")
-                || trimmed.starts_with("observer")
-                || trimmed.starts_with("ensure")
-                || trimmed.starts_with("choice")
-                || trimmed.starts_with("key")
-                || trimmed.starts_with("maintainer"))
-        {
-            in_with_block = false;
-        }
-
-        if in_with_block && trimmed.contains(" : ") {
-            let parts: Vec<&str> = trimmed.splitn(2, " : ").collect();
-            if parts.len() == 2 {
-                let field_name = parts[0].trim().to_string();
-                let type_str = parts[1].trim();
-                // Skip lines that look like type signatures for functions
-                if !field_name.contains(' ') && !field_name.is_empty() {
-                    fields.push(Field {
-                        name: field_name,
-                        type_: DamlType::from_str(type_str),
-                        span: Span {
-                            file: file.to_path_buf(),
-                            line: body_offset + idx + 1,
-                            column: indent_level(line) + 1,
-                        },
+fn lower_do(stmts: &[DoStmt]) -> Vec<Statement> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            DoStmt::Let { bindings, .. } => {
+                for b in bindings {
+                    let mut name = b.pat.render();
+                    for p in &b.params {
+                        name.push(' ');
+                        name.push_str(&p.render());
+                    }
+                    out.push(Statement::Let {
+                        name,
+                        expr: b.expr.render(),
+                    });
+                    // A plain `let x = create ...` binds an Update value
+                    // without executing it, but a let-bound local helper
+                    // (`let go x = do archive x`) performs its actions when
+                    // invoked from this body — surface those.
+                    if !b.params.is_empty() {
+                        let mut acts = Vec::new();
+                        collect_actions(&b.expr, &mut acts);
+                        out.extend(acts);
+                    }
+                }
+            }
+            DoStmt::Bind { pat, expr, .. } => {
+                let mut acts = Vec::new();
+                if collect_actions(expr, &mut acts) {
+                    out.extend(acts);
+                } else {
+                    out.push(Statement::Other {
+                        raw: format!("{} <- {}", pat.render(), expr.render()),
+                    });
+                }
+            }
+            DoStmt::Expr { expr, .. } => {
+                let mut acts = Vec::new();
+                if collect_actions(expr, &mut acts) {
+                    out.extend(acts);
+                } else {
+                    out.push(Statement::Other {
+                        raw: expr.render(),
                     });
                 }
             }
         }
     }
-
-    fields
+    out
 }
 
-fn extract_clause(body: &[&str], keyword: &str) -> Vec<String> {
-    let mut results = Vec::new();
-    for line in body {
-        let trimmed = line.trim();
-        if trimmed.starts_with(keyword) {
-            let rest = trimmed[keyword.len()..].trim();
-            // Parse party expressions: could be `admin`, `[admin, user]`, etc.
-            let parties: Vec<String> = rest
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            results.extend(parties);
+/// Walk an expression collecting ledger-action statements (create,
+/// exercise, fetch, archive, assert, try/catch). Returns true if anything
+/// was collected. Only unqualified applications count: `Lifecycle.exercise`
+/// is a user function, not the ledger action.
+fn collect_actions(expr: &Expr, out: &mut Vec<Statement>) -> bool {
+    let before = out.len();
+    match expr {
+        Expr::Do { stmts, .. } => {
+            out.extend(lower_do(stmts));
         }
+        Expr::Try { body, handlers, .. } => {
+            let try_body = statements_of_expr(body);
+            let mut catch_body = Vec::new();
+            for h in handlers {
+                catch_body.extend(statements_of_expr(&h.body));
+            }
+            out.push(Statement::TryCatch {
+                try_body,
+                catch_body,
+            });
+        }
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_actions(then_branch, out);
+            collect_actions(else_branch, out);
+        }
+        Expr::Case { alts, .. } => {
+            for a in alts {
+                collect_actions(&a.body, out);
+            }
+        }
+        Expr::LetIn { body, .. } => {
+            collect_actions(body, out);
+        }
+        Expr::Lambda { body, .. } => {
+            collect_actions(body, out);
+        }
+        Expr::Neg { expr, .. } => {
+            collect_actions(expr, out);
+        }
+        Expr::BinOp { op, lhs, rhs, pos } => {
+            // `create $ Foo with ...` — `$` is application.
+            if op == "$" {
+                let as_app = Expr::App {
+                    func: lhs.clone(),
+                    args: vec![(**rhs).clone()],
+                    pos: *pos,
+                };
+                if classify_app(&as_app, out) {
+                    return out.len() > before;
+                }
+            }
+            collect_actions(lhs, out);
+            collect_actions(rhs, out);
+        }
+        Expr::App { args, .. } => {
+            if !classify_app(expr, out) {
+                for a in args {
+                    collect_actions(a, out);
+                }
+            }
+        }
+        Expr::Tuple { items, .. } | Expr::List { items, .. } => {
+            for i in items {
+                collect_actions(i, out);
+            }
+        }
+        _ => {}
     }
-    results
+    out.len() > before
 }
 
-fn extract_ensure(body: &[&str], body_offset: usize, file: &Path) -> Option<EnsureClause> {
-    for (idx, line) in body.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("ensure ") || trimmed == "ensure" {
-            // Collect the ensure clause which may span multiple lines
-            let ensure_indent = indent_level(line);
-            let mut raw_text = trimmed.to_string();
-            let mut j = idx + 1;
-            while j < body.len() {
-                let next_trimmed = body[j].trim();
-                if next_trimmed.is_empty() {
-                    j += 1;
-                    continue;
-                }
-                if indent_level(body[j]) > ensure_indent {
-                    raw_text.push(' ');
-                    raw_text.push_str(next_trimmed);
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            return Some(EnsureClause {
-                raw_text,
-                span: Span {
-                    file: file.to_path_buf(),
-                    line: body_offset + idx + 1,
-                    column: indent_level(line) + 1,
-                },
-            });
-        }
+/// If `expr` is an application of a ledger-action head, push the matching
+/// statement(s) and return true.
+fn classify_app(expr: &Expr, out: &mut Vec<Statement>) -> bool {
+    let args = expr.app_args();
+    if args.is_empty() {
+        return false;
     }
-    None
-}
-
-fn extract_choices(body: &[&str], body_offset: usize, file: &Path) -> Vec<Choice> {
-    let mut choices = Vec::new();
-    let mut i = 0;
-
-    while i < body.len() {
-        let trimmed = body[i].trim();
-
-        // Detect consuming modifiers
-        let (is_consuming, choice_line) = if trimmed.starts_with("nonconsuming choice ")
-            || trimmed.starts_with("preconsuming choice ")
-            || trimmed.starts_with("postconsuming choice ")
-        {
-            (false, trimmed)
-        } else if trimmed.starts_with("choice ") {
-            (true, trimmed)
-        } else {
-            i += 1;
-            continue;
-        };
-
-        // Parse "choice Name : ReturnType"
-        let after_choice = if let Some(rest) = choice_line.strip_prefix("nonconsuming choice ") {
-            rest
-        } else if let Some(rest) = choice_line.strip_prefix("preconsuming choice ") {
-            rest
-        } else if let Some(rest) = choice_line.strip_prefix("postconsuming choice ") {
-            rest
-        } else {
-            choice_line.strip_prefix("choice ").unwrap()
-        };
-
-        let (choice_name, return_type) = if after_choice.contains(" : ") {
-            let parts: Vec<&str> = after_choice.splitn(2, " : ").collect();
-            (
-                parts[0].trim().to_string(),
-                DamlType::from_str(parts[1].trim()),
-            )
-        } else {
-            (after_choice.trim().to_string(), DamlType::Unknown)
-        };
-
-        let choice_indent = indent_level(body[i]);
-        let span = Span {
-            file: file.to_path_buf(),
-            line: body_offset + i + 1,
-            column: choice_indent + 1,
-        };
-
-        // Collect the choice body
-        let choice_start = i + 1;
-        let mut choice_end = choice_start;
-        while choice_end < body.len() {
-            if body[choice_end].trim().is_empty() {
-                choice_end += 1;
-                continue;
-            }
-            if indent_level(body[choice_end]) <= choice_indent
-                && !body[choice_end].trim().is_empty()
-            {
-                break;
-            }
-            choice_end += 1;
-        }
-
-        let choice_body = &body[choice_start..choice_end];
-        let parameters = extract_choice_params(choice_body, body_offset + choice_start, file);
-        let controllers = extract_clause(choice_body, "controller");
-        let body_raw = choice_body.iter().map(|l| *l).collect::<Vec<&str>>().join("\n");
-        let statements = extract_statements(&body_raw);
-
-        choices.push(Choice {
-            name: choice_name,
-            consuming: is_consuming,
-            controllers,
-            parameters,
-            return_type,
-            body: statements,
-            body_raw,
-            span,
-        });
-
-        i = choice_end;
-    }
-
-    choices
-}
-
-fn extract_choice_params(body: &[&str], body_offset: usize, file: &Path) -> Vec<Field> {
-    let mut fields = Vec::new();
-    let mut in_with = false;
-    let mut with_indent = 0;
-
-    for (idx, line) in body.iter().enumerate() {
-        let trimmed = line.trim();
-
-        if trimmed == "with" {
-            in_with = true;
-            with_indent = indent_level(line);
-            continue;
-        }
-
-        if in_with {
-            if trimmed.starts_with("controller")
-                || trimmed.starts_with("do")
-                || (indent_level(line) <= with_indent && !trimmed.is_empty())
-            {
-                in_with = false;
-                continue;
-            }
-
-            if trimmed.contains(" : ") {
-                let parts: Vec<&str> = trimmed.splitn(2, " : ").collect();
-                if parts.len() == 2 {
-                    let field_name = parts[0].trim().to_string();
-                    if !field_name.contains(' ') && !field_name.is_empty() {
-                        fields.push(Field {
-                            name: field_name,
-                            type_: DamlType::from_str(parts[1].trim()),
-                            span: Span {
-                                file: file.to_path_buf(),
-                                line: body_offset + idx + 1,
-                                column: indent_level(line) + 1,
-                            },
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    fields
-}
-
-fn extract_statements(body_raw: &str) -> Vec<Statement> {
-    let mut statements = Vec::new();
-    let lines: Vec<&str> = body_raw.lines().collect();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let trimmed = strip_comment(lines[i].trim());
-
-        if trimmed.is_empty()
-            || trimmed.starts_with("with")
-            || trimmed.starts_with("controller")
-            || trimmed.starts_with("do")
-            || trimmed.contains(" : ") && !trimmed.contains("<-")
-        {
-            i += 1;
-            continue;
-        }
-
-        if trimmed.starts_with("let ") {
-            let rest = trimmed.strip_prefix("let ").unwrap();
-            if let Some(eq_pos) = rest.find('=') {
-                let name = rest[..eq_pos].trim().to_string();
-                let expr = rest[eq_pos + 1..].trim().to_string();
-                statements.push(Statement::Let { name, expr });
-            }
-        } else if trimmed.starts_with("assertMsg") || trimmed.starts_with("assert ") {
-            statements.push(Statement::Assert {
-                condition: trimmed.to_string(),
-            });
-        } else if trimmed.contains("fetchAndArchive") || (trimmed.contains("fetch") && !trimmed.contains("fetchByKey")) {
-            if trimmed.contains("fetchAndArchive") {
-                let cid = trimmed
-                    .split("fetchAndArchive")
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                statements.push(Statement::Archive { cid_expr: cid.clone() });
-                statements.push(Statement::Fetch { cid_expr: cid });
-            } else if trimmed.contains("<-") && trimmed.contains("fetch ") {
-                let cid = trimmed
-                    .split("fetch ")
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                statements.push(Statement::Fetch { cid_expr: cid });
-            }
-        } else if trimmed.starts_with("archive ") || trimmed.contains("<- archive ") {
-            let cid = trimmed
-                .split("archive ")
-                .nth(1)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            statements.push(Statement::Archive { cid_expr: cid });
-        } else if has_keyword(trimmed, "create ") {
-            statements.push(Statement::Create {
-                template_name: String::new(),
-                raw: trimmed.to_string(),
-            });
-        } else if has_keyword(trimmed, "exercise ") {
-            statements.push(Statement::Exercise {
-                cid_expr: String::new(),
-                choice_name: String::new(),
-                raw: trimmed.to_string(),
-            });
-        } else if trimmed.starts_with("try") || trimmed == "try" {
-            // Collect try body
-            let try_indent = indent_level(lines[i]);
-            let mut try_body_lines = Vec::new();
-            let mut catch_body_lines = Vec::new();
-            let mut in_catch = false;
-            let mut j = i + 1;
-            while j < lines.len() {
-                let inner_trimmed = lines[j].trim();
-                if inner_trimmed.starts_with("catch") {
-                    in_catch = true;
-                    j += 1;
-                    continue;
-                }
-                if !inner_trimmed.is_empty()
-                    && indent_level(lines[j]) <= try_indent
-                    && !in_catch
-                {
-                    break;
-                }
-                if in_catch {
-                    catch_body_lines.push(lines[j]);
-                } else {
-                    try_body_lines.push(lines[j]);
-                }
-                j += 1;
-            }
-            let try_raw = try_body_lines.join("\n");
-            let catch_raw = catch_body_lines.join("\n");
-            statements.push(Statement::TryCatch {
-                try_body: extract_statements(&try_raw),
-                catch_body: extract_statements(&catch_raw),
-            });
-            i = j;
-            continue;
-        } else {
-            statements.push(Statement::Other {
-                raw: trimmed.to_string(),
-            });
-        }
-
-        i += 1;
-    }
-
-    statements
-}
-
-fn extract_functions(lines: &[&str], file: &Path, _templates: &[Template]) -> Vec<Function> {
-    let mut functions = Vec::new();
-    let mut i = 0;
-
-    // Collect line ranges that are inside templates to skip them
-    let mut template_ranges: Vec<(usize, usize)> = Vec::new();
-    {
-        let mut ti = 0;
-        while ti < lines.len() {
-            let trimmed = lines[ti].trim();
-            if trimmed.starts_with("template ") && !trimmed.starts_with("template instance") {
-                let template_indent = indent_level(lines[ti]);
-                let start = ti;
-                ti += 1;
-                while ti < lines.len() {
-                    if lines[ti].trim().is_empty() {
-                        ti += 1;
-                        continue;
-                    }
-                    if indent_level(lines[ti]) <= template_indent
-                        && !lines[ti].trim().is_empty()
-                    {
-                        break;
-                    }
-                    ti += 1;
-                }
-                template_ranges.push((start, ti));
-            } else {
-                ti += 1;
-            }
-        }
-    }
-
-    let in_template = |line_idx: usize| -> bool {
-        template_ranges.iter().any(|(s, e)| line_idx >= *s && line_idx < *e)
+    let head_name = match expr.app_head() {
+        Expr::Var {
+            qualifier: None,
+            name,
+            ..
+        } => name.as_str(),
+        _ => return false,
     };
-
-    while i < lines.len() {
-        if in_template(i) {
-            i += 1;
-            continue;
-        }
-
-        let trimmed = lines[i].trim();
-
-        // Look for top-level function definitions: name ... = ...
-        // or name arg1 arg2 = ...
-        if !trimmed.is_empty()
-            && !trimmed.starts_with("module ")
-            && !trimmed.starts_with("import ")
-            && !trimmed.starts_with("--")
-            && !trimmed.starts_with("{-")
-            && !trimmed.starts_with("template ")
-            && indent_level(lines[i]) == 0
-            && trimmed.contains(" = ")
-            || (indent_level(lines[i]) == 0
-                && trimmed.contains('=')
-                && !trimmed.starts_with("module")
-                && !trimmed.starts_with("import")
-                && !trimmed.starts_with("--")
-                && !trimmed.starts_with("template")
-                && !in_template(i))
-        {
-            let name = trimmed.split_whitespace().next().unwrap_or("").to_string();
-            if name.is_empty()
-                || name.starts_with(|c: char| c.is_uppercase())
-                || name == "type"
-                || name == "data"
-                || name == "class"
-                || name == "instance"
-                || name == "deriving"
-            {
-                i += 1;
-                continue;
-            }
-
-            let func_start = i;
-            let mut func_end = i + 1;
-            while func_end < lines.len() {
-                if lines[func_end].trim().is_empty() {
-                    func_end += 1;
-                    continue;
-                }
-                if indent_level(lines[func_end]) == 0 {
-                    // Another equation of the same function (pattern matching
-                    // on arguments) — keep it in this function, don't split.
-                    if lines[func_end].trim().split_whitespace().next() == Some(name.as_str()) {
-                        func_end += 1;
-                        continue;
-                    }
-                    break;
-                }
-                func_end += 1;
-            }
-
-            let body_raw = lines[func_start..func_end].join("\n");
-            // For statement extraction, drop everything left of `=` on each
-            // equation head so the function's own name is not read as a
-            // statement (a function named `exercise` must not flag itself).
-            let statement_lines: Vec<String> = lines[func_start..func_end]
-                .iter()
-                .map(|l| {
-                    let is_equation_head = indent_level(l) == 0
-                        && l.trim().split_whitespace().next() == Some(name.as_str());
-                    match (is_equation_head, l.find('=')) {
-                        (true, Some(p)) => l[p + 1..].to_string(),
-                        _ => (*l).to_string(),
-                    }
-                })
-                .collect();
-            let statements = extract_statements(&statement_lines.join("\n"));
-
-            functions.push(Function {
-                name,
-                body: statements,
-                body_raw,
-                span: Span {
-                    file: file.to_path_buf(),
-                    line: func_start + 1,
-                    column: 1,
-                },
+    let arg_text = |i: usize| args.get(i).map(|a| a.render()).unwrap_or_default();
+    match head_name {
+        "create" | "createCmd" => {
+            out.push(Statement::Create {
+                template_name: template_name_of(args.first()),
+                raw: expr.render(),
             });
-
-            i = func_end;
-        } else {
-            i += 1;
+            true
         }
+        "exercise" | "exerciseByKey" | "exerciseCmd" | "exerciseByKeyCmd" => {
+            out.push(Statement::Exercise {
+                cid_expr: arg_text(0),
+                choice_name: choice_name_of(args.get(1)),
+                raw: expr.render(),
+            });
+            true
+        }
+        "createAndExerciseCmd" => {
+            out.push(Statement::Create {
+                template_name: template_name_of(args.first()),
+                raw: expr.render(),
+            });
+            out.push(Statement::Exercise {
+                cid_expr: arg_text(0),
+                choice_name: choice_name_of(args.get(1)),
+                raw: expr.render(),
+            });
+            true
+        }
+        "fetch" => {
+            out.push(Statement::Fetch {
+                cid_expr: arg_text(0),
+            });
+            true
+        }
+        "fetchAndArchive" => {
+            out.push(Statement::Archive {
+                cid_expr: arg_text(0),
+            });
+            out.push(Statement::Fetch {
+                cid_expr: arg_text(0),
+            });
+            true
+        }
+        "archive" => {
+            out.push(Statement::Archive {
+                cid_expr: arg_text(0),
+            });
+            true
+        }
+        "assert" | "assertMsg" => {
+            out.push(Statement::Assert {
+                condition: expr.render(),
+            });
+            true
+        }
+        _ => false,
     }
+}
 
-    functions
+fn template_name_of(arg: Option<&Expr>) -> String {
+    match arg {
+        Some(Expr::Record { base, .. }) => template_name_of(Some(base)),
+        Some(Expr::Con {
+            qualifier, name, ..
+        }) => match qualifier {
+            Some(q) => format!("{}.{}", q, name),
+            None => name.clone(),
+        },
+        Some(Expr::Var { name, .. }) if name == "this" => "this".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn choice_name_of(arg: Option<&Expr>) -> String {
+    match arg {
+        Some(Expr::Record { base, .. }) => choice_name_of(Some(base)),
+        Some(Expr::Con {
+            qualifier, name, ..
+        }) => match qualifier {
+            Some(q) => format!("{}.{}", q, name),
+            None => name.clone(),
+        },
+        Some(Expr::App { func, .. }) => choice_name_of(Some(func)),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -703,6 +513,15 @@ template SimpleHolding
         assert_eq!(t.choices.len(), 1);
         assert_eq!(t.choices[0].name, "Transfer");
         assert_eq!(t.choices[0].parameters.len(), 1);
+        // The real parser extracts structure the shim could not:
+        assert!(matches!(
+            t.choices[0].return_type,
+            DamlType::ContractId(_)
+        ));
+        assert!(t.choices[0]
+            .body
+            .iter()
+            .any(|s| matches!(s, Statement::Create { template_name, .. } if template_name == "this")));
     }
 
     #[test]
@@ -744,5 +563,101 @@ template Foo
         let module = parse_daml(source, Path::new("Foo.daml"));
         assert_eq!(module.templates[0].choices.len(), 1);
         assert!(!module.templates[0].choices[0].consuming);
+    }
+
+    #[test]
+    fn test_comment_with_exercise_keyword_is_not_a_statement() {
+        let source = r#"module Test where
+
+template Foo
+  with
+    owner : Party
+  where
+    signatory owner
+
+    choice Go : ()
+      controller owner
+      do
+        -- electing to exercise the option
+        pure ()
+"#;
+        let module = parse_daml(source, Path::new("Foo.daml"));
+        let body = &module.templates[0].choices[0].body;
+        assert!(
+            !body.iter().any(|s| matches!(s, Statement::Exercise { .. })),
+            "comment text must not become an Exercise statement: {:?}",
+            body
+        );
+    }
+
+    #[test]
+    fn test_exercise_extracts_cid_and_choice() {
+        let source = r#"module Test where
+
+template Foo
+  with
+    owner : Party
+  where
+    signatory owner
+
+    choice Go : ()
+      controller owner
+      do
+        result <- exercise optionCid Elect with electorParty = owner
+        pure ()
+"#;
+        let module = parse_daml(source, Path::new("Foo.daml"));
+        let body = &module.templates[0].choices[0].body;
+        let ex = body
+            .iter()
+            .find_map(|s| match s {
+                Statement::Exercise {
+                    cid_expr,
+                    choice_name,
+                    ..
+                } => Some((cid_expr.clone(), choice_name.clone())),
+                _ => None,
+            })
+            .expect("exercise statement");
+        assert_eq!(ex.0, "optionCid");
+        assert_eq!(ex.1, "Elect");
+    }
+
+    #[test]
+    fn test_signatory_list_flattened() {
+        let source = r#"module Test where
+
+template Foo
+  with
+    a : Party
+    b : Party
+  where
+    signatory [a, b]
+"#;
+        let module = parse_daml(source, Path::new("Foo.daml"));
+        assert_eq!(module.templates[0].signatories, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_interface_methods_are_not_functions() {
+        let source = r#"module Test where
+
+interface Base where
+  viewtype View
+  getOwner : Party
+
+  nonconsuming choice GetView : View
+    with
+      viewer : Party
+    controller viewer
+    do
+      pure (view this)
+"#;
+        let module = parse_daml(source, Path::new("Base.daml"));
+        assert!(
+            module.functions.is_empty(),
+            "interface methods must not be extracted as top-level functions: {:?}",
+            module.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
     }
 }

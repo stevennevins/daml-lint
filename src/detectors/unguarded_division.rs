@@ -25,6 +25,12 @@ impl UnguardedDivision {
 
         for (line_idx, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
+            // Comment text (ASCII diagrams full of slashes) is not code.
+            let trimmed = match trimmed.find("--") {
+                Some(0) => continue,
+                Some(idx) => trimmed[..idx].trim_end(),
+                None => trimmed,
+            };
 
             // Find division: look for / operator or `div` function
             let has_division = trimmed.contains(" / ")

@@ -1,5 +1,7 @@
 mod detector;
+mod ast;
 mod lexer;
+mod parse;
 mod layout;
 mod detectors;
 mod ir;
@@ -95,7 +97,16 @@ fn main() {
             }
         };
 
-        let module = parser::parse_daml(&source, file);
+        let (module, diagnostics) = parser::parse_daml_with_diagnostics(&source, file);
+        for (line, column, message) in &diagnostics {
+            eprintln!(
+                "daml-lint: parse: {}:{}:{}: {}",
+                file.display(),
+                line,
+                column,
+                message
+            );
+        }
 
         for det in &detectors {
             let findings = det.detect(&module);
