@@ -10,7 +10,8 @@ function on_choice(choice: Choice, template: Template): void {
   if (!choice.consuming) {
     return;
   }
-  if (choice.controllers.some((c) => template.signatories.includes(c))) {
+  // `controller signatory this` is signatory-controlled by definition.
+  if (choice.controllers.some((c) => c.startsWith("signatory") || template.signatories.includes(c))) {
     return;
   }
   report(choice, `Consuming choice '${choice.name}' has no signatory among its controllers`);
