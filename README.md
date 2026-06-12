@@ -99,7 +99,9 @@ in `body` are maps keyed by kind, e.g. `stmt.contains("Create")`.
 
 Heads up: `module` is a reserved word in Rhai — name your `check` parameter
 something else (e.g. `m`). If a script fails at runtime the scan aborts with
-exit code 2; rule errors are never swallowed.
+exit code 2; rule errors are never swallowed. Accessing a property that
+doesn't exist on a node is an error (catches typos), and scripts are capped
+at 10M operations per module so a runaway loop can't hang CI.
 
 `SEVERITY` is one of `critical`, `high`, `medium`, `low`, `info`. Custom rules
 run alongside the built-in detectors, appear in all output formats, and count

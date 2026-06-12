@@ -43,11 +43,24 @@ pub struct ScriptDetector {
     path: String,
 }
 
+fn new_engine() -> Engine {
+    let mut engine = Engine::new();
+    // Debug builds halve rhai's default expression-depth limits, rejecting
+    // ordinary nested rules — lift the limit, scripts are trusted code.
+    engine.set_max_expr_depths(0, 0);
+    // ...but a rule with an infinite loop must not hang CI forever.
+    engine.set_max_operations(10_000_000);
+    // IR node maps always contain every key, so a missing property is a typo —
+    // fail loud instead of silently evaluating to ().
+    engine.set_fail_on_invalid_map_property(true);
+    engine
+}
+
 pub fn load_script(path: &Path) -> Result<Box<dyn Detector>, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read rules script {}: {}", path.display(), e))?;
 
-    let engine = Engine::new();
+    let engine = new_engine();
     let ast = engine
         .compile(&source)
         .map_err(|e| format!("invalid rules script {}: {}", path.display(), e))?;
@@ -82,6 +95,22 @@ pub fn load_script(path: &Path) -> Result<Box<dyn Detector>, String> {
             VISITORS.join(", ")
         ));
     }
+    // A visitor with the wrong arity would silently never be called.
+    for f in ast.iter_functions() {
+        if !VISITORS.contains(&f.name) {
+            continue;
+        }
+        let two_arg_ok = matches!(f.name, "on_choice" | "on_field");
+        if f.params.len() != 1 && !(two_arg_ok && f.params.len() == 2) {
+            return Err(format!(
+                "rule '{}': {} takes {} parameter(s) — expected 1{}",
+                name,
+                f.name,
+                f.params.len(),
+                if two_arg_ok { " or 2" } else { "" }
+            ));
+        }
+    }
 
     Ok(Box::new(ScriptDetector {
         name,
@@ -99,7 +128,7 @@ impl ScriptDetector {
     fn run(&self, module: &DamlModule) -> Result<Vec<Finding>, String> {
         let reported: Reported = Rc::new(RefCell::new(Vec::new()));
 
-        let mut engine = Engine::new();
+        let mut engine = new_engine();
         let sink = reported.clone();
         engine.register_fn("report", move |node: rhai::Map, message: &str| {
             let (line, column) = span_of(&node);
@@ -125,8 +154,11 @@ impl ScriptDetector {
             .collect();
         let has = |name: &str, arity: usize| arities.iter().any(|(n, a)| n == name && *a == arity);
         let call = |scope: &mut Scope, name: &str, args: Vec<Dynamic>| -> Result<(), String> {
+            // eval_ast(false): the top level already ran once above — without
+            // this, call_fn re-evaluates it before every visitor call.
+            let options = rhai::CallFnOptions::new().eval_ast(false);
             engine
-                .call_fn::<Dynamic>(scope, &ast, name, args)
+                .call_fn_with_options::<Dynamic>(options, scope, &ast, name, args)
                 .map(|_| ())
                 .map_err(|e| format!("rule '{}': {} failed: {}", self.name, name, e))
         };
@@ -356,6 +388,46 @@ const SEVERITY = "low";
 "#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrong_arity_visitor_rejected() {
+        let result = load_script_from_str(
+            "arity",
+            r#"
+const NAME = "x";
+const SEVERITY = "low";
+fn on_choice(c, t, extra) {}
+"#,
+        );
+        match result {
+            Err(e) => assert!(e.contains("expected 1 or 2")),
+            Ok(_) => panic!("3-parameter visitor should be rejected, not silently ignored"),
+        }
+    }
+
+    #[test]
+    fn test_nested_expressions_compile() {
+        // Debug builds halve rhai's expression-depth limits; this README-shaped
+        // rule must compile in both profiles.
+        let det = load_script_from_str(
+            "nested",
+            r#"
+const NAME = "nested";
+const SEVERITY = "low";
+
+fn on_choice(choice) {
+    for stmt in choice.body {
+        if stmt.contains("Create") {
+            report(choice, `Choice '${choice.name}' creates contracts`);
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let module = parse_daml(TEMPLATE_NO_ENSURE, Path::new("Test.daml"));
+        det.detect(&module);
     }
 
     #[test]
