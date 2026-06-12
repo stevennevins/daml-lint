@@ -577,6 +577,20 @@ impl Parser {
                     }
                 }
             },
+            Some("controller") => {
+                // Legacy Daml 1.x `controller <party> can` choice blocks are
+                // not analyzed — fail loud instead of silently dropping the
+                // choices inside.
+                self.diag(
+                    "legacy 'controller ... can' syntax is not supported; \
+                     choices inside this block are not analyzed",
+                );
+                self.skip_to_item_end();
+                TemplateBodyDecl::Other {
+                    raw: self.slice_text(start),
+                    pos,
+                }
+            }
             _ => {
                 self.skip_to_item_end();
                 TemplateBodyDecl::Other {

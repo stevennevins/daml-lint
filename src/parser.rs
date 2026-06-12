@@ -13,7 +13,9 @@ use crate::parse::parse_module;
 use std::path::Path;
 
 /// Parse a DAML source file into a DamlModule IR. Never panics; parse
-/// problems degrade to partial structure.
+/// problems degrade to partial structure. (Diagnostics-free entry point,
+/// used by tests and kept as the stable API.)
+#[allow(dead_code)]
 pub fn parse_daml(source: &str, file: &Path) -> DamlModule {
     parse_daml_with_diagnostics(source, file).0
 }
@@ -665,9 +667,16 @@ fn classify_app(
             true
         }
         "assert" | "assertMsg" => {
+            // The condition is the assert's argument (after the message for
+            // assertMsg), not the whole call.
+            let cond_idx = if head_name == "assertMsg" { 1 } else { 0 };
+            let condition_expr = args
+                .get(cond_idx)
+                .map(lower_expr)
+                .unwrap_or_else(|| lower_expr(expr));
             out.push(Statement::Assert {
                 condition: expr.render(),
-                condition_expr: lower_expr(expr),
+                condition_expr,
                 span,
             });
             true

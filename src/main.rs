@@ -1,5 +1,8 @@
 mod detector;
 mod adversarial_tests;
+// The AST keeps positions and payloads on every node for completeness;
+// not all are read by the current lowering.
+#[allow(dead_code)]
 mod ast;
 mod corpus_tests;
 mod lexer;
