@@ -124,7 +124,7 @@ impl ScriptDetector {
             .map(|f| (f.name.to_string(), f.params.len()))
             .collect();
         let has = |name: &str, arity: usize| arities.iter().any(|(n, a)| n == name && *a == arity);
-        let mut call = |scope: &mut Scope, name: &str, args: Vec<Dynamic>| -> Result<(), String> {
+        let call = |scope: &mut Scope, name: &str, args: Vec<Dynamic>| -> Result<(), String> {
             engine
                 .call_fn::<Dynamic>(scope, &ast, name, args)
                 .map(|_| ())
