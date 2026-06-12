@@ -139,6 +139,8 @@ fn discover_files(paths: &[PathBuf]) -> Vec<PathBuf> {
             }
         } else if path.is_dir() {
             walk_dir(path, &mut files);
+        } else {
+            eprintln!("Warning: scan path {} does not exist.", path.display());
         }
     }
     files.sort();

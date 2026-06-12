@@ -10,6 +10,6 @@ const SHADOW_PRONE = ["DA.Map", "DA.TextMap", "DA.Set", "DA.List", "DA.Optional"
 
 function on_import(imp: Import): void {
   if (!imp.qualified && SHADOW_PRONE.includes(imp.module_name)) {
-    report(1, `Import '${imp.module_name}' unqualified — its names shadow Prelude; use 'import qualified ${imp.module_name}'`);
+    report(imp, `Import '${imp.module_name}' unqualified — its names shadow Prelude; use 'import qualified ${imp.module_name}'`);
   }
 }

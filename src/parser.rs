@@ -11,7 +11,7 @@ use std::path::Path;
 pub fn parse_daml(source: &str, file: &Path) -> DamlModule {
     let lines: Vec<&str> = source.lines().collect();
     let module_name = extract_module_name(&lines);
-    let imports = extract_imports(&lines);
+    let imports = extract_imports(&lines, file);
     let templates = extract_templates(&lines, file);
     let functions = extract_functions(&lines, file, &templates);
 
@@ -40,9 +40,9 @@ fn extract_module_name(lines: &[&str]) -> String {
     "Unknown".to_string()
 }
 
-fn extract_imports(lines: &[&str]) -> Vec<Import> {
+fn extract_imports(lines: &[&str], file: &Path) -> Vec<Import> {
     let mut imports = Vec::new();
-    for line in lines {
+    for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("import ") {
             let qualified = trimmed.contains("qualified");
@@ -53,6 +53,10 @@ fn extract_imports(lines: &[&str]) -> Vec<Import> {
                     p.starts_with(|c: char| c.is_uppercase()) && **p != "qualified"
                 })
                 .unwrap_or(&"Unknown")
+                // `import DA.Map(fromList)` — the import list can abut the name
+                .split('(')
+                .next()
+                .unwrap_or("Unknown")
                 .to_string();
             let alias = parts
                 .iter()
@@ -63,10 +67,45 @@ fn extract_imports(lines: &[&str]) -> Vec<Import> {
                 module_name,
                 qualified,
                 alias,
+                span: Span {
+                    file: file.to_path_buf(),
+                    line: idx + 1,
+                    column: 1,
+                },
             });
         }
     }
     imports
+}
+
+/// True if `kw` appears as a standalone keyword — not as part of a longer
+/// identifier or a qualified call (`Lifecycle.exercise` is a function named
+/// exercise, not the ledger action).
+fn has_keyword(line: &str, kw: &str) -> bool {
+    let mut start = 0;
+    while let Some(idx) = line[start..].find(kw) {
+        let abs = start + idx;
+        let preceded_by_ident = line[..abs]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c == '.' || c.is_alphanumeric() || c == '_');
+        if !preceded_by_ident {
+            return true;
+        }
+        start = abs + kw.len();
+    }
+    false
+}
+
+/// Strip a trailing `--` line comment; full-comment lines become empty.
+fn strip_comment(trimmed: &str) -> &str {
+    if trimmed.starts_with("--") {
+        return "";
+    }
+    match trimmed.find(" --") {
+        Some(idx) => trimmed[..idx].trim_end(),
+        None => trimmed,
+    }
 }
 
 fn indent_level(line: &str) -> usize {
@@ -384,7 +423,7 @@ fn extract_statements(body_raw: &str) -> Vec<Statement> {
     let mut i = 0;
 
     while i < lines.len() {
-        let trimmed = lines[i].trim();
+        let trimmed = strip_comment(lines[i].trim());
 
         if trimmed.is_empty()
             || trimmed.starts_with("with")
@@ -434,12 +473,12 @@ fn extract_statements(body_raw: &str) -> Vec<Statement> {
                 .trim()
                 .to_string();
             statements.push(Statement::Archive { cid_expr: cid });
-        } else if trimmed.contains("create ") && !trimmed.contains("create this") || trimmed.contains("create this") {
+        } else if has_keyword(trimmed, "create ") {
             statements.push(Statement::Create {
                 template_name: String::new(),
                 raw: trimmed.to_string(),
             });
-        } else if trimmed.contains("exercise ") {
+        } else if has_keyword(trimmed, "exercise ") {
             statements.push(Statement::Exercise {
                 cid_expr: String::new(),
                 choice_name: String::new(),
@@ -575,14 +614,34 @@ fn extract_functions(lines: &[&str], file: &Path, _templates: &[Template]) -> Ve
                     func_end += 1;
                     continue;
                 }
-                if indent_level(lines[func_end]) == 0 && !lines[func_end].trim().is_empty() {
+                if indent_level(lines[func_end]) == 0 {
+                    // Another equation of the same function (pattern matching
+                    // on arguments) — keep it in this function, don't split.
+                    if lines[func_end].trim().split_whitespace().next() == Some(name.as_str()) {
+                        func_end += 1;
+                        continue;
+                    }
                     break;
                 }
                 func_end += 1;
             }
 
             let body_raw = lines[func_start..func_end].join("\n");
-            let statements = extract_statements(&body_raw);
+            // For statement extraction, drop everything left of `=` on each
+            // equation head so the function's own name is not read as a
+            // statement (a function named `exercise` must not flag itself).
+            let statement_lines: Vec<String> = lines[func_start..func_end]
+                .iter()
+                .map(|l| {
+                    let is_equation_head = indent_level(l) == 0
+                        && l.trim().split_whitespace().next() == Some(name.as_str());
+                    match (is_equation_head, l.find('=')) {
+                        (true, Some(p)) => l[p + 1..].to_string(),
+                        _ => (*l).to_string(),
+                    }
+                })
+                .collect();
+            let statements = extract_statements(&statement_lines.join("\n"));
 
             functions.push(Function {
                 name,

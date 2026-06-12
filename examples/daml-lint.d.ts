@@ -97,6 +97,7 @@ interface Import {
   module_name: string;
   qualified: boolean;
   alias: string | null;
+  span: Span;
 }
 
 interface DamlModule {

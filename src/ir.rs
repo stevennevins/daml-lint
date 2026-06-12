@@ -183,6 +183,7 @@ pub struct Import {
     pub module_name: String,
     pub qualified: bool,
     pub alias: Option<String>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Serialize)]
