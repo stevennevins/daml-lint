@@ -197,8 +197,10 @@ logBoth x = trace "a" (trace "b" x)
             "backspace",
             r#"[{"name": "x", "severity": "low", "pattern": "\btrace\b", "message": "m"}]"#,
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("doubled"));
+        match result {
+            Err(e) => assert!(e.contains("doubled")),
+            Ok(_) => panic!("single-backslash pattern should be rejected"),
+        }
     }
 
     #[test]
