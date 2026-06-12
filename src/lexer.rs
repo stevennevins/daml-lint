@@ -189,6 +189,16 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     self.push(Tok::RBrace, pos);
                 }
+                // CPP preprocessor directive (#ifdef/#endif/#include...) at
+                // column 1 — daml-prim/stdlib sources use {-# LANGUAGE CPP #-};
+                // directives are line-based, skip the whole line.
+                '#' if self.column == 1
+                    && self.peek_at(1).is_some_and(|c| c.is_ascii_lowercase()) =>
+                {
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.bump();
+                    }
+                }
                 '"' => self.string_lit(pos),
                 '\'' => self.char_lit(pos),
                 c if c.is_ascii_digit() => self.number(pos),

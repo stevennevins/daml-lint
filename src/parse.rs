@@ -189,6 +189,14 @@ impl Parser {
                     self.bump();
                     break;
                 }
+                // A stray closing bracket inside a block is garbage from a
+                // failed item parse — discard it or the loop cannot make
+                // progress (skip_to_item_end deliberately stops before
+                // unmatched closers).
+                Some(Tok::RParen) | Some(Tok::RBracket) => {
+                    self.bump();
+                    continue;
+                }
                 _ => {}
             }
             let before = self.i;
@@ -433,7 +441,37 @@ impl Parser {
                     self.bump();
                     break;
                 }
+                // A stray closing bracket inside a block is garbage from a
+                // failed item parse — discard it or the loop cannot make
+                // progress (skip_to_item_end deliberately stops before
+                // unmatched closers).
+                Some(Tok::RParen) | Some(Tok::RBracket) => {
+                    self.bump();
+                    continue;
+                }
                 _ => {}
+            }
+            // A field item must look like `name [, name] : Type`. If the
+            // next item doesn't (an empty `with` swallowed the following
+            // clause into its layout block — `with` + comment + `controller`),
+            // stop without consuming so the caller can parse the clause.
+            {
+                let mut j = self.i;
+                loop {
+                    match self.toks.get(j).map(|t| &t.tok) {
+                        Some(Tok::LowerId { qualifier: None, .. }) => j += 1,
+                        _ => break,
+                    }
+                    match self.toks.get(j).map(|t| &t.tok) {
+                        Some(Tok::Comma) => j += 1,
+                        _ => break,
+                    }
+                }
+                let is_field = j > self.i
+                    && self.toks.get(j).map(|t| &t.tok).is_some_and(|t| t.is_op(":"));
+                if !is_field {
+                    break;
+                }
             }
             let before = self.i;
             // One or more comma-separated names, then `:`, then the type.
@@ -486,6 +524,14 @@ impl Parser {
                 Some(Tok::VRBrace) | Some(Tok::RBrace) => {
                     self.bump();
                     break;
+                }
+                // A stray closing bracket inside a block is garbage from a
+                // failed item parse — discard it or the loop cannot make
+                // progress (skip_to_item_end deliberately stops before
+                // unmatched closers).
+                Some(Tok::RParen) | Some(Tok::RBracket) => {
+                    self.bump();
+                    continue;
                 }
                 _ => {}
             }
@@ -736,6 +782,14 @@ impl Parser {
                     self.bump();
                     break;
                 }
+                // A stray closing bracket inside a block is garbage from a
+                // failed item parse — discard it or the loop cannot make
+                // progress (skip_to_item_end deliberately stops before
+                // unmatched closers).
+                Some(Tok::RParen) | Some(Tok::RBracket) => {
+                    self.bump();
+                    continue;
+                }
                 _ => {}
             }
             match self.peek().and_then(|t| t.keyword()) {
@@ -809,6 +863,11 @@ impl Parser {
                     Some(Tok::VRBrace) | Some(Tok::RBrace) => {
                         self.bump();
                         break;
+                    }
+                    // Stray closer: discard so the loop always progresses.
+                    Some(Tok::RParen) | Some(Tok::RBracket) => {
+                        self.bump();
+                        continue;
                     }
                     _ => {}
                 }
@@ -968,6 +1027,14 @@ impl Parser {
                     self.bump();
                     break;
                 }
+                // A stray closing bracket inside a block is garbage from a
+                // failed item parse — discard it or the loop cannot make
+                // progress (skip_to_item_end deliberately stops before
+                // unmatched closers).
+                Some(Tok::RParen) | Some(Tok::RBracket) => {
+                    self.bump();
+                    continue;
+                }
                 _ => {}
             }
             match self.binding() {
@@ -982,6 +1049,15 @@ impl Parser {
     /// type signature (skipped, returns None).
     fn binding(&mut self) -> Option<Binding> {
         let pos = self.pos();
+        // Operator binding or signature: `(==) : Text -> Bool = ...` —
+        // skip the whole item; operators aren't surfaced in the IR.
+        if self.at(&Tok::LParen)
+            && matches!(self.peek_at(1), Some(Tok::Op(_)))
+            && self.peek_at(2) == Some(&Tok::RParen)
+        {
+            self.skip_to_item_end();
+            return None;
+        }
         let pat = self.pattern_atom()?;
         let mut params = Vec::new();
         loop {
@@ -1488,6 +1564,11 @@ impl Parser {
                     self.bump();
                     break;
                 }
+                // Stray closer: discard so the loop always progresses.
+                Some(Tok::RParen) | Some(Tok::RBracket) => {
+                    self.bump();
+                    continue;
+                }
                 _ => {}
             }
             let pos = self.pos();
@@ -1693,6 +1774,11 @@ impl Parser {
                         self.bump();
                         break;
                     }
+                    // Stray closer: discard so the loop always progresses.
+                    Some(Tok::RParen) | Some(Tok::RBracket) => {
+                        self.bump();
+                        continue;
+                    }
                     _ => {}
                 }
                 // An alternative can carry a `where` block for its body.
@@ -1756,6 +1842,11 @@ impl Parser {
                     Some(Tok::VRBrace) | Some(Tok::RBrace) => {
                         self.bump();
                         break;
+                    }
+                    // Stray closer: discard so the loop always progresses.
+                    Some(Tok::RParen) | Some(Tok::RBracket) => {
+                        self.bump();
+                        continue;
                     }
                     _ => {}
                 }
@@ -1842,6 +1933,11 @@ impl Parser {
                         Some(Tok::VRBrace) | Some(Tok::RBrace) => {
                             self.bump();
                             break;
+                        }
+                        // Stray closer: discard so the loop always progresses.
+                        Some(Tok::RParen) | Some(Tok::RBracket) => {
+                            self.bump();
+                            continue;
                         }
                         _ => {}
                     }

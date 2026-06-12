@@ -191,6 +191,59 @@ fn comment_between_template_and_fields() {
     assert_eq!(m.templates[0].fields.len(), 1);
 }
 
+/// Regression: operator bindings in where blocks left the cursor on an
+/// unmatched ')' that block loops refused to consume — infinite loop.
+/// Found by scanning the daml SDK corpus (Control/Exception/Base.daml).
+#[test]
+fn operator_binding_in_where_no_hang() {
+    let m = parse(concat!(
+        "module M where\n",
+        "f x = implode x\n",
+        "  where\n",
+        "    implode : [Text] -> Text = primitive @\"BEImplodeText\"\n",
+        "    (==) : Text -> Text -> Bool = primitive @\"BEEqual\"\n",
+        "    helper y = y\n",
+        "g = 2\n",
+    ));
+    assert!(m.functions.iter().any(|f| f.name == "g"));
+}
+
+/// CPP directives at column 1 (daml-prim/stdlib use LANGUAGE CPP) are
+/// line-based and skipped; `#` elsewhere stays an operator.
+#[test]
+fn cpp_directives_skipped() {
+    let m = parse(concat!(
+        "module M where\n",
+        "#ifdef DAML_BIGNUMERIC\n",
+        "f = 1\n",
+        "#endif\n",
+        "g = 2\n",
+    ));
+    assert_eq!(m.functions.len(), 2);
+}
+
+/// An empty `with` block (comment-only) must not swallow the following
+/// controller clause (deliberate fixture in the daml SDK test suite).
+#[test]
+fn empty_with_block_before_controller() {
+    let m = parse(concat!(
+        "module M where\n",
+        "template T\n",
+        "  with\n",
+        "    owner : Party\n",
+        "  where\n",
+        "    signatory owner\n",
+        "    choice F : ()\n",
+        "      with -- superfluous, no fields\n",
+        "      controller owner\n",
+        "      do pure ()\n",
+    ));
+    let c = &m.templates[0].choices[0];
+    assert_eq!(c.name, "F");
+    assert_eq!(c.controllers, vec!["owner"]);
+    assert!(c.parameters.is_empty());
+}
+
 #[test]
 fn huge_single_line() {
     let mut src = String::from("module M where\nf = ");
