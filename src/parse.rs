@@ -275,7 +275,9 @@ impl Parser {
             Some(t)
                 if matches!(
                     t.keyword(),
-                    Some("infix" | "infixl" | "infixr")
+                    // Fixity declarations, class-default declarations, and
+                    // pattern synonyms have no IR surface.
+                    Some("infix" | "infixl" | "infixr" | "default" | "pattern")
                 ) =>
             {
                 self.skip_to_item_end();
@@ -352,6 +354,10 @@ impl Parser {
         let pos = self.pos();
         self.bump(); // import
         let mut qualified = self.eat_keyword("qualified");
+        // Package-qualified import: `import qualified "pkg-name" Main as V1`.
+        if matches!(self.peek(), Some(Tok::StringLit(_))) {
+            self.bump();
+        }
         let module_name = match self.peek().cloned() {
             Some(Tok::UpperId { qualifier, name }) => {
                 self.bump();
@@ -946,6 +952,31 @@ impl Parser {
         self.bump(); // name
         let mut params = Vec::new();
         while !self.at_op("=") && !self.at_op("|") {
+            // Combined signature + body: `name (x : a) : RetType = expr` —
+            // consume the return-type annotation up to the `=`.
+            if self.at_op(":") {
+                self.bump();
+                let mut brackets = 0usize;
+                while let Some(t) = self.peek() {
+                    match t {
+                        Tok::Op(o) if o == "=" && brackets == 0 => break,
+                        Tok::VSemi | Tok::VRBrace | Tok::Semi | Tok::RBrace => break,
+                        Tok::LParen | Tok::LBracket => brackets += 1,
+                        Tok::RParen | Tok::RBracket => {
+                            brackets = brackets.saturating_sub(1)
+                        }
+                        _ => {}
+                    }
+                    self.i += 1;
+                }
+                continue;
+            }
+            // Infix operator definition: `f $ x = f x`, `as <&> f = ...` —
+            // operators have no IR surface; skip the item silently.
+            if matches!(self.peek(), Some(Tok::Op(o)) if !is_reserved_op(o)) {
+                self.skip_to_item_end();
+                return None;
+            }
             match self.peek() {
                 None | Some(Tok::VSemi) | Some(Tok::VRBrace) | Some(Tok::Semi)
                 | Some(Tok::RBrace) => {
@@ -1088,9 +1119,28 @@ impl Parser {
                 });
             }
             if self.at_op(":") {
-                // Type signature inside a let/where block — skip it.
-                self.skip_to_item_end();
-                return None;
+                if params.is_empty() {
+                    // Type signature inside a let/where block — skip it.
+                    self.skip_to_item_end();
+                    return None;
+                }
+                // Combined signature + body: `f (x : a) : Ret = expr` —
+                // consume the return-type annotation up to the `=`.
+                self.bump();
+                let mut brackets = 0usize;
+                while let Some(t) = self.peek() {
+                    match t {
+                        Tok::Op(o) if o == "=" && brackets == 0 => break,
+                        Tok::VSemi | Tok::VRBrace | Tok::Semi | Tok::RBrace => break,
+                        Tok::LParen | Tok::LBracket => brackets += 1,
+                        Tok::RParen | Tok::RBracket => {
+                            brackets = brackets.saturating_sub(1)
+                        }
+                        _ => {}
+                    }
+                    self.i += 1;
+                }
+                continue;
             }
             match self.peek() {
                 None | Some(Tok::VSemi) | Some(Tok::VRBrace) | Some(Tok::Semi)
