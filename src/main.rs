@@ -30,9 +30,10 @@ struct Cli {
     #[arg(long, default_value = "high")]
     fail_on: String,
 
-    /// JSON file with custom regex detector rules (see examples/custom-rules.json)
+    /// Custom rule files: .json (regex rules) or .rhai (AST rules). Repeatable.
+    /// See examples/custom-rules.json and examples/*.rhai
     #[arg(long)]
-    rules: Option<PathBuf>,
+    rules: Vec<PathBuf>,
 }
 
 fn main() {
@@ -56,19 +57,34 @@ fn main() {
 
     // Load detectors first so rule-file errors surface before scanning
     let mut detectors = detector::all_detectors();
-    if let Some(rules_path) = &cli.rules {
-        match detectors::custom::load_rules(rules_path) {
-            Ok(custom) => {
-                if custom.is_empty() {
+    for rules_path in &cli.rules {
+        let loaded = match rules_path.extension().and_then(|e| e.to_str()) {
+            Some("json") => detectors::custom::load_rules(rules_path),
+            Some("rhai") => detectors::script::load_script(rules_path).map(|d| vec![d]),
+            _ => Err(format!(
+                "rules file {} must end in .json (regex rules) or .rhai (AST rules)",
+                rules_path.display()
+            )),
+        };
+        match loaded {
+            Ok(rules) => {
+                if rules.is_empty() {
                     eprintln!("Warning: rules file {} contains no rules.", rules_path.display());
                 }
-                detectors.extend(custom);
+                detectors.extend(rules);
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
                 std::process::exit(2);
             }
         }
+    }
+    if let Some(dup) = detector::find_duplicate_name(&detectors) {
+        eprintln!(
+            "Error: rule '{}': name collides with a built-in detector or another rule",
+            dup
+        );
+        std::process::exit(2);
     }
 
     // Discover .daml files

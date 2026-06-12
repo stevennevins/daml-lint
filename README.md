@@ -58,11 +58,59 @@ daml-lint ./daml/ --format sarif --output report.sarif
 
 ### Custom detectors
 
-Define your own detectors as regex rules in a JSON file and pass it with `--rules`:
+Define your own detectors and pass them with `--rules` (repeatable). Two kinds:
+
+- **AST rules** (`.rhai`) — script with visitor functions over the parsed module, in the style of [solhint custom rules](https://github.com/protofire/solhint/blob/master/docs/writing-plugins.md). Use these for anything structural.
+- **Regex rules** (`.json`) — match raw source lines. Use these for simple banned-token checks.
 
 ```sh
-daml-lint ./daml/ --rules examples/custom-rules.json
+daml-lint ./daml/ --rules my-rules.rhai --rules more-rules.json
 ```
+
+#### AST rules
+
+A rule is a [Rhai](https://rhai.rs) script: constants for metadata, plus visitor
+functions named after the node types you care about — like solhint's
+`ContractDefinition(node)` callbacks:
+
+```rhai
+const NAME = "template-requires-ensure";
+const SEVERITY = "medium";
+const DESCRIPTION = "Every template must declare an ensure clause";   // optional
+
+fn on_template(template) {
+    if template.ensure_clause == () {
+        report(template, `Template '${template.name}' has no ensure clause`);
+    }
+}
+```
+
+Visitors (define any subset, at least one):
+
+| Function | Called for | Node fields |
+|---|---|---|
+| `on_template(template)` | each template | `name`, `fields`, `signatories`, `observers`, `ensure_clause` (`()` if absent), `choices`, `span` |
+| `on_choice(choice [, template])` | each choice | `name`, `consuming`, `controllers`, `parameters`, `return_type`, `body`, `body_raw`, `span` |
+| `on_field(field [, template])` | each template field | `name`, `type_`, `span` |
+| `on_function(function)` | each top-level function | `name`, `body`, `body_raw`, `span` |
+| `on_import(import)` | each import | `module_name`, `qualified`, `alias` |
+| `check(m)` | once per module | `name`, `file`, `imports`, `templates`, `functions`, `source` |
+
+Report findings with `report(node, message)` (location taken from the node's
+`span`) or `report(line, message)`. The rule's `SEVERITY` applies to all its
+findings. Node shapes mirror the IR in [src/ir.rs](src/ir.rs); statement nodes
+in `body` are maps keyed by kind, e.g. `stmt.contains("Create")`.
+
+Heads up: `module` is a reserved word in Rhai — name your `check` parameter
+something else (e.g. `m`). If a script fails at runtime the scan aborts with
+exit code 2; rule errors are never swallowed.
+
+See [examples/template-requires-ensure.rhai](examples/template-requires-ensure.rhai)
+and [examples/consuming-choice-signatory-controller.rhai](examples/consuming-choice-signatory-controller.rhai)
+(the latter cross-references choice controllers against template signatories —
+the kind of rule regex can't express).
+
+#### Regex rules
 
 Each rule scans every source line and reports a finding where the pattern matches:
 

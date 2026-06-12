@@ -2,7 +2,6 @@ use crate::detector::{parse_severity, Detector, Finding, Severity};
 use crate::ir::DamlModule;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::path::Path;
 
 /// Custom detector: user-defined regex rule loaded from a JSON file via --rules.
@@ -44,19 +43,10 @@ pub fn load_rules(path: &Path) -> Result<Vec<Box<dyn Detector>>, String> {
     let raw: Vec<RawRule> = serde_json::from_str(&text)
         .map_err(|e| format!("invalid rules file {}: {}", path.display(), e))?;
 
-    let mut seen: HashSet<String> = crate::detector::all_detectors()
-        .iter()
-        .map(|d| d.name().to_string())
-        .collect();
-
+    // Name collisions (against builtins and other rule files) are checked
+    // globally in main over the full detector list.
     raw.into_iter()
         .map(|r| {
-            if !seen.insert(r.name.clone()) {
-                return Err(format!(
-                    "rule '{}': name collides with a built-in detector or another rule",
-                    r.name
-                ));
-            }
             let severity = parse_severity(&r.severity).ok_or_else(|| {
                 format!(
                     "rule '{}': unknown severity '{}'. Use critical, high, medium, low, or info.",
@@ -204,22 +194,18 @@ logBoth x = trace "a" (trace "b" x)
     }
 
     #[test]
-    fn test_load_rules_rejects_builtin_name_collision() {
-        let result = load_rules_from_str(
-            "builtin-collision",
-            r#"[{"name": "unguarded-division", "severity": "low", "pattern": "x", "message": "m"}]"#,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_load_rules_rejects_duplicate_rule_names() {
-        let result = load_rules_from_str(
+    fn test_duplicate_names_caught_by_global_check() {
+        let detectors = load_rules_from_str(
             "dup-names",
-            r#"[{"name": "a", "severity": "low", "pattern": "x", "message": "m"},
-                {"name": "a", "severity": "low", "pattern": "y", "message": "m"}]"#,
+            r#"[{"name": "unguarded-division", "severity": "low", "pattern": "x", "message": "m"}]"#,
+        )
+        .unwrap();
+        let mut all = crate::detector::all_detectors();
+        all.extend(detectors);
+        assert_eq!(
+            crate::detector::find_duplicate_name(&all),
+            Some("unguarded-division".to_string())
         );
-        assert!(result.is_err());
     }
 
     #[test]

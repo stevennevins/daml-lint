@@ -59,6 +59,17 @@ use crate::detectors::positive_amount::MissingPositiveAmount;
 use crate::detectors::unbounded_fields::UnboundedFields;
 use crate::detectors::unguarded_division::UnguardedDivision;
 
+/// Returns the first detector name that appears more than once, if any.
+pub fn find_duplicate_name(detectors: &[Box<dyn Detector>]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    for det in detectors {
+        if !seen.insert(det.name()) {
+            return Some(det.name().to_string());
+        }
+    }
+    None
+}
+
 pub fn all_detectors() -> Vec<Box<dyn Detector>> {
     vec![
         Box::new(MissingEnsureDecimal),
