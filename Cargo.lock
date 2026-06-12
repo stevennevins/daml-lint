@@ -186,7 +186,6 @@ name = "daml-lint"
 version = "0.1.0"
 dependencies = [
  "clap",
- "regex",
  "rhai",
  "serde",
  "serde_json",

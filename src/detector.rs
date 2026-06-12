@@ -80,3 +80,17 @@ pub fn all_detectors() -> Vec<Box<dyn Detector>> {
         Box::new(ArchiveBeforeExecute),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_duplicate_name() {
+        assert_eq!(find_duplicate_name(&all_detectors()), None);
+
+        let mut doubled = all_detectors();
+        doubled.extend(all_detectors());
+        assert!(find_duplicate_name(&doubled).is_some());
+    }
+}

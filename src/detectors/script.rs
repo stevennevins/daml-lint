@@ -370,5 +370,6 @@ const SEVERITY = "low";
         assert!(
             load_script(Path::new("examples/consuming-choice-signatory-controller.rhai")).is_ok()
         );
+        assert!(load_script(Path::new("examples/no-trace.rhai")).is_ok());
     }
 }

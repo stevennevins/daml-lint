@@ -30,8 +30,7 @@ struct Cli {
     #[arg(long, default_value = "high")]
     fail_on: String,
 
-    /// Custom rule files: .json (regex rules) or .rhai (AST rules). Repeatable.
-    /// See examples/custom-rules.json and examples/*.rhai
+    /// Custom AST rule scripts (.rhai), repeatable. See examples/*.rhai
     #[arg(long)]
     rules: Vec<PathBuf>,
 }
@@ -58,21 +57,8 @@ fn main() {
     // Load detectors first so rule-file errors surface before scanning
     let mut detectors = detector::all_detectors();
     for rules_path in &cli.rules {
-        let loaded = match rules_path.extension().and_then(|e| e.to_str()) {
-            Some("json") => detectors::custom::load_rules(rules_path),
-            Some("rhai") => detectors::script::load_script(rules_path).map(|d| vec![d]),
-            _ => Err(format!(
-                "rules file {} must end in .json (regex rules) or .rhai (AST rules)",
-                rules_path.display()
-            )),
-        };
-        match loaded {
-            Ok(rules) => {
-                if rules.is_empty() {
-                    eprintln!("Warning: rules file {} contains no rules.", rules_path.display());
-                }
-                detectors.extend(rules);
-            }
+        match detectors::script::load_script(rules_path) {
+            Ok(rule) => detectors.push(rule),
             Err(e) => {
                 eprintln!("Error: {}", e);
                 std::process::exit(2);

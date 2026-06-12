@@ -58,16 +58,12 @@ daml-lint ./daml/ --format sarif --output report.sarif
 
 ### Custom detectors
 
-Define your own detectors and pass them with `--rules` (repeatable). Two kinds:
-
-- **AST rules** (`.rhai`) — script with visitor functions over the parsed module, in the style of [solhint custom rules](https://github.com/protofire/solhint/blob/master/docs/writing-plugins.md). Use these for anything structural.
-- **Regex rules** (`.json`) — match raw source lines. Use these for simple banned-token checks.
+Define your own detectors as AST rule scripts and pass them with `--rules`
+(repeatable), in the style of [solhint custom rules](https://github.com/protofire/solhint/blob/master/docs/writing-plugins.md):
 
 ```sh
-daml-lint ./daml/ --rules my-rules.rhai --rules more-rules.json
+daml-lint ./daml/ --rules my-rule.rhai --rules another-rule.rhai
 ```
-
-#### AST rules
 
 A rule is a [Rhai](https://rhai.rs) script: constants for metadata, plus visitor
 functions named after the node types you care about — like solhint's
@@ -105,37 +101,18 @@ Heads up: `module` is a reserved word in Rhai — name your `check` parameter
 something else (e.g. `m`). If a script fails at runtime the scan aborts with
 exit code 2; rule errors are never swallowed.
 
-See [examples/template-requires-ensure.rhai](examples/template-requires-ensure.rhai)
-and [examples/consuming-choice-signatory-controller.rhai](examples/consuming-choice-signatory-controller.rhai)
-(the latter cross-references choice controllers against template signatories —
-the kind of rule regex can't express).
+`SEVERITY` is one of `critical`, `high`, `medium`, `low`, `info`. Custom rules
+run alongside the built-in detectors, appear in all output formats, and count
+toward `--fail-on`. Rule names must not collide with built-in detector names
+or each other.
 
-#### Regex rules
+Examples:
 
-Each rule scans every source line and reports a finding where the pattern matches:
+- [examples/template-requires-ensure.rhai](examples/template-requires-ensure.rhai) — structural check on a single node
+- [examples/consuming-choice-signatory-controller.rhai](examples/consuming-choice-signatory-controller.rhai) — cross-references choice controllers against template signatories
+- [examples/no-trace.rhai](examples/no-trace.rhai) — banned-token check over raw source lines
 
-```json
-[
-  {
-    "name": "no-trace",
-    "severity": "low",
-    "description": "Debug trace left in code",
-    "pattern": "\\btrace\\b",
-    "message": "Remove debug trace calls before deploying"
-  }
-]
-```
-
-`severity` is one of `critical`, `high`, `medium`, `low`, `info`. `pattern` is a Rust regex; `description` is optional. Custom rules run alongside the built-in detectors and appear in all output formats. See [examples/custom-rules.json](examples/custom-rules.json) for a complete example.
-
-Things to know:
-
-- Backslashes in regexes must be doubled for JSON: write `"\\btrace\\b"` to mean the regex `\btrace\b`. A single-backslash `"\b"` is rejected with an error.
-- Patterns match raw source lines, including comments and string literals — `-- TODO: remove trace` will trigger a `trace` rule. A line matching N times yields N findings.
-- Patterns are matched one line at a time, so multiline constructs can't be matched.
-- Rule names must not collide with built-in detector names or each other.
-
-To check that a rules file parses without running a scan, point the tool at a nonexistent path — rule errors are reported before file discovery. (A valid rules file then prints `No .daml files found.`, which also exits 2 — go by the message, not the exit code.)
+To check that a rule script parses without running a scan, point the tool at a nonexistent path — rule errors are reported before file discovery. (A valid script then prints `No .daml files found.`, which also exits 2 — go by the message, not the exit code.)
 
 ### CI gating
 
