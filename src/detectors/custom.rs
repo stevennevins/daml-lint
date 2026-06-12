@@ -63,6 +63,15 @@ pub fn load_rules(path: &Path) -> Result<Vec<Box<dyn Detector>>, String> {
                     r.name, r.severity
                 )
             })?;
+            // JSON turns a single-backslash "\b" or "\f" into a literal control
+            // character, so the regex compiles but never matches — catch it here.
+            if r.pattern.contains(['\u{08}', '\u{0C}']) {
+                return Err(format!(
+                    "rule '{}': pattern contains a literal backspace/formfeed character — \
+                     backslashes must be doubled in JSON (write \"\\\\b\" for a word boundary)",
+                    r.name
+                ));
+            }
             let pattern = Regex::new(&r.pattern)
                 .map_err(|e| format!("rule '{}': invalid pattern: {}", r.name, e))?;
             Ok(Box::new(CustomDetector {
@@ -178,6 +187,18 @@ logBoth x = trace "a" (trace "b" x)
             r#"[{"name": "x", "severity": "huge", "pattern": "x", "message": "m"}]"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_rules_rejects_single_backslash_word_boundary() {
+        // "\b" in JSON is a literal backspace — the regex would compile but
+        // silently never match, so it must be rejected loudly.
+        let result = load_rules_from_str(
+            "backspace",
+            r#"[{"name": "x", "severity": "low", "pattern": "\btrace\b", "message": "m"}]"#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("doubled"));
     }
 
     #[test]

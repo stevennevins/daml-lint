@@ -5,7 +5,7 @@ mod parser;
 mod reporter;
 
 use clap::Parser;
-use detector::{parse_severity, Severity};
+use detector::parse_severity;
 use reporter::OutputFormat;
 use std::path::PathBuf;
 

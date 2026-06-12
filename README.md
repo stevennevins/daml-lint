@@ -82,12 +82,12 @@ Each rule scans every source line and reports a finding where the pattern matche
 
 Things to know:
 
-- Backslashes in regexes must be doubled for JSON: write `"\\btrace\\b"` to mean the regex `\btrace\b`.
-- Patterns match raw source lines, including comments and string literals — `-- TODO: remove trace` will trigger a `trace` rule.
+- Backslashes in regexes must be doubled for JSON: write `"\\btrace\\b"` to mean the regex `\btrace\b`. A single-backslash `"\b"` is rejected with an error.
+- Patterns match raw source lines, including comments and string literals — `-- TODO: remove trace` will trigger a `trace` rule. A line matching N times yields N findings.
 - Patterns are matched one line at a time, so multiline constructs can't be matched.
 - Rule names must not collide with built-in detector names or each other.
 
-To check that a rules file parses without running a scan, point the tool at any path — rule errors are reported before file discovery and exit with code 2.
+To check that a rules file parses without running a scan, point the tool at a nonexistent path — rule errors are reported before file discovery. (A valid rules file then prints `No .daml files found.`, which also exits 2 — go by the message, not the exit code.)
 
 ### CI gating
 
